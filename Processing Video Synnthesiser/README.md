@@ -4,6 +4,10 @@ Emulates the behaviour of analog video mixers like the Edirol V4/V8 with interna
 
 Designed for Raspberry Pi deployment — optimised for OpenGL ES 2.0/3.0.
 
+## Video Example
+https://youtu.be/Zpdnd-aILro
+
+
 ## Overview
 
 This shader simulates the classic analog video feedback effect where the output is fed back into the input with transformations applied each frame. Unlike camera-based feedback, this implementation uses internal generators to seed the feedback loop, making it fully self-contained.
