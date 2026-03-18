@@ -1,0 +1,882 @@
+// ============================================================================
+// FEEDBACK SHADER TEST SKETCH
+// ============================================================================
+// Processing sketch for testing the analog video feedback shader.
+// Optimised for Raspberry Pi 3 deployment.
+// Includes keyboard controls and MIDI input via javax.sound.midi.
+//
+// Pi 3 optimisations:
+//   - Render buffers at 640x360 (upscaled to window size for display)
+//   - Target frame rate capped at 30fps
+//   - HUD drawn every 15 frames to reduce GL state changes
+//   - All mode uniforms sent as float (matches branchless shader)
+//
+// Controls (no conflicts - lowercase=primary, SHIFT=secondary):
+//   --- Generator ---
+//   1-6            : Generator types (voronoi, domain-warped, outlined-shapes, stripes, reaction-diff, moire)
+//   z/x            : Generator frequency -/+
+//   c/v            : Generator size -/+
+//   b/n            : Generator pos X -/+
+//   ,/.            : Generator pos Y -/+
+//   ;/'            : Generator softness +/-
+//   [/]            : Generator hue -/+
+//   +/-            : Generator intensity +/-
+//   SPACE          : Trigger flash
+//
+//   --- Feedback ---
+//   q/a            : Feedback amount +/-
+//   w/s            : Decay +/-
+//   Shift+Q / Shift+W : Tap2 amount +/-
+//   Shift+E / Shift+R : Tap2 offset +/-
+//   Shift+T        : Delay amount +
+//   Shift+Y        : Displace amount +
+//
+//   --- Transform ---
+//   e/d            : Scale +/-
+//   r/f            : Rotation +/-
+//   m              : Mirror mode cycle
+//
+//   --- Colour ---
+//   t/g            : Hue shift +/-
+//   Shift+S / Shift+D  : Saturation +/-
+//   Shift+F / Shift+G  : Brightness +/-
+//   Shift+H / Shift+J  : Contrast +/-
+//   Shift+K / Shift+L  : RGB separation +/-
+//   Shift+; / Shift+'  : Invert +/-
+//
+//   --- Edge Detection ---
+//   y/h            : Edge type cycle +/-
+//   u/j            : Edge mix +/-
+//   7/8            : Edge threshold +/-
+//   9              : Edge colour mode cycle
+//   p              : Edge pre-feedback toggle
+//
+//   --- Effects ---
+//   i/k            : Posterize levels +/-
+//   o/l            : Solarize amount +/-
+//   Shift+Z / Shift+X  : Threshold +/-
+//   Shift+C / Shift+V  : Pixelate +/-
+//   Shift+A            : Effects pre-feedback toggle
+//
+//   --- Blend & Post ---
+//   Shift+B        : Blend mode cycle
+//   Shift+N        : Blur +
+//   Shift+M        : Noise +
+//   <              : Soft clip +
+//   >              : Sharpen +
+//
+//   --- Utility ---
+//   BACKSPACE      : Clear buffers
+//   0              : Reset to defaults
+//   Shift+1..6 (!, @, #, $, %, ^): Load presets
+//   TAB            : Toggle HUD display
+// ============================================================================
+
+// MIDI via pure Java javax.sound.midi (no external libs)
+import javax.sound.midi.*;
+
+MidiDevice midiInputDevice;
+Transmitter midiTransmitter;
+Receiver midiReceiver;
+MidiDevice.Info[] midiInfos;
+int midiDeviceIndex = 6; // set to 0..N-1 to force a specific device, or -1 for auto
+
+PShader feedbackShader;
+PGraphics[] buffers = new PGraphics[2];
+int currentBuffer = 0;
+PGraphics delayBuffer; // Long-delay feedback buffer
+int frameCounter = 0;  // For delay buffer update timing
+
+// Render resolution (independent of window size for Pi 3 performance)
+final int RENDER_W = 640;
+final int RENDER_H = 360;
+
+// HUD control
+boolean showHUD = true;
+final int HUD_INTERVAL = 15; // only redraw HUD every N frames
+
+// Fullscreen toggle
+boolean isFullScreen = false;
+final int WINDOW_W = 1280;
+final int WINDOW_H = 720;
+
+
+// MIDI thread safety: incoming MIDI writes to these volatile pending values,
+// draw() copies them to the active params at the start of each frame.
+volatile boolean midiDirty = false;
+
+ArrayList<String> imageFiles = new ArrayList<String>();
+int currentImageIndex = 0;
+PImage sourceImage;       // Currently loaded image (resized to RENDER_W x RENDER_H)
+
+// Parameters with defaults - all floats (including modes) for branchless shader
+float gen_type = 1;
+float gen_frequency = 1.0;
+float gen_size = 0.3;
+float gen_pos_x = 0.0;
+float gen_pos_y = 0.0;
+float gen_softness = 0.5;
+float gen_hue = 0.0;
+float gen_intensity = 0.5;
+float gen_trigger = 0.0;
+
+float fb_amount = 0.9;
+float fb_decay = 0.98;
+float fb_tap2_amount = 0.0;
+float fb_tap2_offset = 0.0;
+float fb_delay_amount = 0.0;
+
+float tf_scale = 1.01;
+float tf_rotation = 0.01;
+float tf_translate_x = 0.0;
+float tf_translate_y = 0.0;
+float tf_mirror = 0;
+float tf_displace = 0.0;
+
+float edge_type = 0;
+float edge_mix = 0.5;
+float edge_threshold = 0.1;
+float edge_colour_mode = 0;
+float edge_pre_fb = 0;
+
+float fx_posterize = 0;
+float fx_posterize_smooth = 0.0;
+float fx_solarize = 0.0;
+float fx_solarize_soft = 0.5;
+float fx_solarize_mode = 0;
+float fx_threshold = 0.0;
+float fx_pixelate = 1.0;
+float fx_pre_fb = 0;
+
+float col_hue_shift = 0.0;
+float col_saturation = 1.0;
+float col_brightness = 0.0;
+float col_contrast = 1.0;
+float col_rgb_sep = 0.0;
+float col_invert = 0.0;
+
+float blend_mode = 0;
+
+float post_blur = 0.0;
+float post_noise = 0.0;
+float post_soft_clip = 0.0;
+float post_sharpen = 0.0;
+
+
+void setup() {
+  size(1280, 720, P2D);
+  surface.setResizable(true);
+
+  // Target 30fps - matches Pi 3 capability, reduces CPU/GPU thrash
+  frameRate(30);
+
+  // Load shader
+  feedbackShader = loadShader("feedback.frag", "passthrough.vert");
+
+  // Create ping-pong buffers at reduced render resolution
+  buffers[0] = createGraphics(RENDER_W, RENDER_H, P2D);
+  buffers[1] = createGraphics(RENDER_W, RENDER_H, P2D);
+  delayBuffer = createGraphics(RENDER_W, RENDER_H, P2D);
+
+  // Clear buffers
+  clearBuffers();
+
+  // Load image library for generator type 7
+  loadImageLibrary();
+  if (imageFiles.size() > 0) loadImageByIndex(0);
+
+  // Initialise MIDI via javax.sound.midi
+  initMidi();
+
+  println("Feedback Shader Test - Pi 3 Optimised");
+  println("--------------------------------------");
+  println("Render: " + RENDER_W + "x" + RENDER_H + " @ 30fps (upscaled to " + width + "x" + height + ")");
+  println("--------------------------------------");
+  println("1-6: Gen type | q/a: Feedback | w/s: Decay");
+  println("e/d: Scale | r/f: Rotation | t/g: Hue shift");
+  println("y/h: Edge type | u/j: Edge mix | 7/8: Edge threshold");
+  println("i/k: Posterize | o/l: Solarize | m: Mirror");
+  println("z/x: Gen freq | c/v: Gen size | b/n: Gen X");
+  println(",/.: Gen Y | ;/': Gen softness | [/]: Gen hue");
+  println("+/-: Gen intensity | SPACE: Trigger | BACKSPACE: Clear");
+  println("SHIFT+S/D: Sat | SHIFT+F/G: Bright | SHIFT+H/J: Contrast");
+  println("SHIFT+K/L: RGB sep | SHIFT+B: Blend | SHIFT+N: Blur");
+  println("SHIFT+M: Noise | <: Soft clip | >: Sharpen");
+  println("0: Reset | TAB: Toggle HUD");
+  println("!: Tunnel | @: Psychedelic | #: Glitch | $: Minimal | %: Kaleidoscope | ^: VHS");
+}
+
+
+void draw() {
+  // Swap buffers
+  int prev = currentBuffer;
+  currentBuffer = 1 - currentBuffer;
+
+  // Update shader uniforms
+  updateShaderUniforms(prev);
+
+  // Render to current buffer at reduced resolution
+  buffers[currentBuffer].beginDraw();
+  buffers[currentBuffer].shader(feedbackShader);
+  buffers[currentBuffer].rect(0, 0, RENDER_W, RENDER_H);
+  buffers[currentBuffer].endDraw();
+
+  // Update delay buffer every 8 frames
+  frameCounter++;
+  if (frameCounter % 8 == 0) {
+    delayBuffer.beginDraw();
+    delayBuffer.image(buffers[currentBuffer], 0, 0);
+    delayBuffer.endDraw();
+  }
+
+  // Upscale to window size for display
+  image(buffers[currentBuffer], 0, 0, width, height);
+
+  // Reset trigger (decay flash)
+  gen_trigger *= 0.9;
+
+  // Display HUD (toggle with TAB)
+  if (showHUD) {
+    displayParameters();
+  }
+}
+
+
+void updateShaderUniforms(int prevBuffer) {
+  feedbackShader.set("u_feedback", buffers[prevBuffer]);
+  feedbackShader.set("u_time", millis() / 1000.0);
+  // Use actual pixel dimensions (accounts for Retina/HiDPI scaling)
+  // On a 2x display, a 640x360 PGraphics has pixelWidth=1280, pixelHeight=720
+  // gl_FragCoord uses real pixels, so u_resolution must match
+  feedbackShader.set("u_resolution", (float)buffers[prevBuffer].pixelWidth, (float)buffers[prevBuffer].pixelHeight);
+
+  // Generator - all sent as float for branchless shader
+  feedbackShader.set("u_gen_type", gen_type);
+  feedbackShader.set("u_gen_frequency", gen_frequency);
+  feedbackShader.set("u_gen_size", gen_size);
+  feedbackShader.set("u_gen_pos_x", gen_pos_x);
+  feedbackShader.set("u_gen_pos_y", gen_pos_y);
+  feedbackShader.set("u_gen_softness", gen_softness);
+  feedbackShader.set("u_gen_hue", gen_hue);
+  feedbackShader.set("u_gen_intensity", gen_intensity);
+  feedbackShader.set("u_gen_trigger", gen_trigger);
+
+  // Feedback
+  feedbackShader.set("u_fb_amount", fb_amount);
+  feedbackShader.set("u_fb_decay", fb_decay);
+  feedbackShader.set("u_fb_tap2_amount", fb_tap2_amount);
+  feedbackShader.set("u_fb_tap2_offset", fb_tap2_offset);
+  feedbackShader.set("u_delay_feedback", delayBuffer);
+  feedbackShader.set("u_fb_delay_amount", fb_delay_amount);
+
+  // Image generator (Type 7)
+  if (sourceImage != null) {
+    feedbackShader.set("u_gen_image", sourceImage);
+  }
+
+  // Transform
+  feedbackShader.set("u_tf_scale", tf_scale);
+  feedbackShader.set("u_tf_rotation", tf_rotation);
+  feedbackShader.set("u_tf_translate_x", tf_translate_x);
+  feedbackShader.set("u_tf_translate_y", tf_translate_y);
+  feedbackShader.set("u_tf_mirror", tf_mirror);
+  feedbackShader.set("u_tf_displace", tf_displace);
+
+  // Edge detection
+  feedbackShader.set("u_edge_type", edge_type);
+  feedbackShader.set("u_edge_mix", edge_mix);
+  feedbackShader.set("u_edge_threshold", edge_threshold);
+  feedbackShader.set("u_edge_colour_mode", edge_colour_mode);
+  feedbackShader.set("u_edge_pre_fb", edge_pre_fb);
+
+  // Effects
+  feedbackShader.set("u_fx_posterize", fx_posterize);
+  feedbackShader.set("u_fx_posterize_smooth", fx_posterize_smooth);
+  feedbackShader.set("u_fx_solarize", fx_solarize);
+  feedbackShader.set("u_fx_solarize_soft", fx_solarize_soft);
+  feedbackShader.set("u_fx_solarize_mode", fx_solarize_mode);
+  feedbackShader.set("u_fx_threshold", fx_threshold);
+  feedbackShader.set("u_fx_pixelate", fx_pixelate);
+  feedbackShader.set("u_fx_pre_fb", fx_pre_fb);
+
+  // Colour
+  feedbackShader.set("u_col_hue_shift", col_hue_shift);
+  feedbackShader.set("u_col_saturation", col_saturation);
+  feedbackShader.set("u_col_brightness", col_brightness);
+  feedbackShader.set("u_col_contrast", col_contrast);
+  feedbackShader.set("u_col_rgb_sep", col_rgb_sep);
+  feedbackShader.set("u_col_invert", col_invert);
+
+  // Blend
+  feedbackShader.set("u_blend_mode", blend_mode);
+
+  // Post
+  feedbackShader.set("u_post_blur", post_blur);
+  feedbackShader.set("u_post_noise", post_noise);
+  feedbackShader.set("u_post_soft_clip", post_soft_clip);
+  feedbackShader.set("u_post_sharpen", post_sharpen);
+}
+
+
+void displayParameters() {
+  fill(0, 0, 0, 180);
+  noStroke();
+  rect(10, 10, 280, 170);
+
+  fill(255);
+  textSize(11);
+  int y = 25;
+  int lineHeight = 14;
+
+  String[] genTypes = {"Off", "Voronoi", "DomainWarp", "Outlines", "Stripes", "ReactionDiff", "Moire", "Image"};
+  String[] edgeTypes = {"Off", "Roberts", "Gradient", "Sobel", "Temporal"};
+  String[] blendTypes = {"Mix", "Add", "Multiply", "Screen", "Diff", "Overlay"};
+
+  text("Gen: " + genTypes[(int)gen_type] + " | Int: " + nf(gen_intensity, 1, 2) + " | Freq: " + nf(gen_frequency, 1, 1), 15, y); y += lineHeight;
+  text("Feedback: " + nf(fb_amount, 1, 2) + " | Decay: " + nf(fb_decay, 1, 2), 15, y); y += lineHeight;
+  text("Tap2: " + nf(fb_tap2_amount, 1, 2) + " | Delay: " + nf(fb_delay_amount, 1, 2) + " | Displace: " + nf(tf_displace, 1, 3), 15, y); y += lineHeight;
+  text("Scale: " + nf(tf_scale, 1, 3) + " | Rot: " + nf(tf_rotation, 1, 3) + " | Mirror: " + (int)tf_mirror, 15, y); y += lineHeight;
+  text("Edge: " + edgeTypes[(int)edge_type] + " | Mix: " + nf(edge_mix, 1, 2) + " | Thr: " + nf(edge_threshold, 1, 2), 15, y); y += lineHeight;
+  text("Posterize: " + (int)fx_posterize + " | Solarize: " + nf(fx_solarize, 1, 2), 15, y); y += lineHeight;
+  text("Hue: " + nf(col_hue_shift, 1, 3) + " | Sat: " + nf(col_saturation, 1, 2) + " | Blend: " + blendTypes[(int)blend_mode], 15, y); y += lineHeight;
+  text("Blur: " + nf(post_blur, 1, 2) + " | Sharp: " + nf(post_sharpen, 1, 2) + " | Noise: " + nf(post_noise, 1, 3), 15, y); y += lineHeight;
+  text("RGB sep: " + nf(col_rgb_sep, 1, 3) + " | Contrast: " + nf(col_contrast, 1, 2), 15, y); y += lineHeight;
+  text("Render: " + RENDER_W + "x" + RENDER_H + " | FPS: " + (int)frameRate, 15, y); y += lineHeight;
+  if ((int)gen_type == 7 && imageFiles.size() > 0) {
+    text("Img: [" + currentImageIndex + "] " + imageFiles.get(currentImageIndex), 15, y);
+  }
+}
+
+
+// ============================================================================
+// FULLSCREEN
+// ============================================================================
+
+void toggleFullScreen() {
+  isFullScreen = !isFullScreen;
+  if (isFullScreen) {
+    surface.setLocation(0, 0);
+    surface.setSize(displayWidth, displayHeight);
+  } else {
+    surface.setSize(WINDOW_W, WINDOW_H);
+    surface.setLocation((displayWidth - WINDOW_W) / 2, (displayHeight - WINDOW_H) / 2);
+  }
+}
+
+
+// ============================================================================
+// IMAGE LIBRARY FUNCTIONS
+// ============================================================================
+
+void loadImageLibrary() {
+  File imgDir = new File(sketchPath("FB Images"));
+  if (!imgDir.exists()) { println("FB Images folder not found."); return; }
+  String[] files = imgDir.list();
+  if (files == null) return;
+  imageFiles = new ArrayList<String>();
+  for (String f : files) {
+    String lower = f.toLowerCase();
+    if (lower.endsWith(".jpg") || lower.endsWith(".jpeg") ||
+        lower.endsWith(".png") || lower.endsWith(".gif") || lower.endsWith(".tga")) {
+      imageFiles.add(f);
+    }
+  }
+  java.util.Collections.sort(imageFiles);
+  println("Image library: " + imageFiles.size() + " images loaded.");
+}
+
+void loadImageByIndex(int idx) {
+  if (imageFiles.size() == 0) return;
+  currentImageIndex = ((idx % imageFiles.size()) + imageFiles.size()) % imageFiles.size();
+  String path = sketchPath("FB Images/" + imageFiles.get(currentImageIndex));
+  sourceImage = loadImage(path);
+  sourceImage.resize(RENDER_W, RENDER_H);
+  println("Image: [" + currentImageIndex + "] " + imageFiles.get(currentImageIndex));
+}
+
+
+// ============================================================================
+// KEYBOARD CONTROLS
+// Fixed: no key conflicts. Lowercase = primary group, SHIFT = secondary group.
+// Uses early return after each match to prevent fallthrough.
+// ============================================================================
+
+void keyPressed() {
+  boolean shifted = (key >= 'A' && key <= 'Z') || key == '!' || key == '@' || key == '#'
+                    || key == '$' || key == '%' || key == '^' || key == '<' || key == '>'
+                    || key == ':' || key == '"';
+
+  // --- Presets (Shift+1..6 -> ! @ # $ % ^) ---
+  if (key == '!') { applyPreset("tunnel"); return; }
+  if (key == '@') { applyPreset("psychedelic"); return; }
+  if (key == '#') { applyPreset("glitch"); return; }
+  if (key == '$') { applyPreset("minimal"); return; }
+  if (key == '%') { applyPreset("kaleidoscope"); return; }
+  if (key == '^') { applyPreset("vhs"); return; }
+
+  // --- Utility ---
+  if (key == '0') { resetParameters(); return; }
+  if (keyCode == BACKSPACE) { clearBuffers(); return; }
+  if (key == ' ') { gen_trigger = 1.0; return; }
+  if (key == TAB) { showHUD = !showHUD; return; }
+  if (key == '\\') { toggleFullScreen(); return; }
+
+  // --- Generator types (number keys, unshifted) ---
+  if (key == '1') { gen_type = 1; return; }
+  if (key == '2' && !shifted) { gen_type = 2; return; }
+  if (key == '3' && !shifted) { gen_type = 3; return; }
+  if (key == '4' && !shifted) { gen_type = 4; return; }
+  if (key == '5' && !shifted) { gen_type = 5; return; }
+  if (key == '6' && !shifted) { gen_type = 6; return; }
+
+  // --- Generator intensity ---
+  if (key == '+' || key == '=') { gen_intensity = constrain(gen_intensity + 0.05, 0, 1); return; }
+  if (key == '-' || key == '_') { gen_intensity = constrain(gen_intensity - 0.05, 0, 1); return; }
+
+  // --- Edge threshold ---
+  if (key == '7') { edge_threshold = constrain(edge_threshold + 0.02, 0.0, 1.0); return; }
+  if (key == '8') { edge_threshold = constrain(edge_threshold - 0.02, 0.0, 1.0); return; }
+
+  // --- Edge colour mode ---
+  if (key == '9') { edge_colour_mode = (edge_colour_mode + 1) % 3; return; }
+
+  // --- Generator hue ---
+  if (key == '[') { gen_hue = (gen_hue - 0.02 + 1.0) % 1.0; return; }
+  if (key == ']') { gen_hue = (gen_hue + 0.02) % 1.0; return; }
+
+  // --- Generator softness ---
+  if (key == ';') { gen_softness = constrain(gen_softness + 0.02, 0.0, 1.0); return; }
+  if (key == '\'') { gen_softness = constrain(gen_softness - 0.02, 0.0, 1.0); return; }
+
+  // --- Generator position Y ---
+  if (key == ',') { gen_pos_y = constrain(gen_pos_y - 0.02, -1.0, 1.0); return; }
+  if (key == '.') { gen_pos_y = constrain(gen_pos_y + 0.02, -1.0, 1.0); return; }
+
+  // --- Arrow keys: cycle images (type 7) ---
+  if (keyCode == LEFT)  { loadImageByIndex(currentImageIndex - 1); return; }
+  if (keyCode == RIGHT) { loadImageByIndex(currentImageIndex + 1); return; }
+
+  // ============================================================
+  // SHIFTED keys (SHIFT + letter)
+  // ============================================================
+
+  if (shifted) {
+    // Feedback tap2 amount
+    if (key == 'Q') { fb_tap2_amount = constrain(fb_tap2_amount + 0.02, 0.0, 1.0); return; }
+    if (key == 'W') { fb_tap2_amount = constrain(fb_tap2_amount - 0.02, 0.0, 1.0); return; }
+
+    // Feedback tap2 offset
+    if (key == 'E') { fb_tap2_offset = constrain(fb_tap2_offset + 0.005, -0.1, 0.1); return; }
+    if (key == 'R') { fb_tap2_offset = constrain(fb_tap2_offset - 0.005, -0.1, 0.1); return; }
+
+    // Delay amount
+    if (key == 'T') { fb_delay_amount = constrain(fb_delay_amount + 0.02, 0.0, 1.0); return; }
+
+    // Displacement amount
+    if (key == 'Y') { tf_displace = constrain(tf_displace + 0.002, 0.0, 0.1); return; }
+
+    // Saturation
+    if (key == 'S') { col_saturation = constrain(col_saturation + 0.05, 0.0, 2.0); return; }
+    if (key == 'D') { col_saturation = constrain(col_saturation - 0.05, 0.0, 2.0); return; }
+
+    // Brightness
+    if (key == 'F') { col_brightness = constrain(col_brightness + 0.02, -0.5, 0.5); return; }
+    if (key == 'G') { col_brightness = constrain(col_brightness - 0.02, -0.5, 0.5); return; }
+
+    // Contrast
+    if (key == 'H') { col_contrast = constrain(col_contrast + 0.05, 0.5, 2.0); return; }
+    if (key == 'J') { col_contrast = constrain(col_contrast - 0.05, 0.5, 2.0); return; }
+
+    // RGB separation
+    if (key == 'K') { col_rgb_sep = constrain(col_rgb_sep + 0.001, 0.0, 0.05); return; }
+    if (key == 'L') { col_rgb_sep = constrain(col_rgb_sep - 0.001, 0.0, 0.05); return; }
+
+    // Invert
+    if (key == ':') { col_invert = constrain(col_invert + 0.05, 0.0, 1.0); return; }
+    if (key == '"') { col_invert = constrain(col_invert - 0.05, 0.0, 1.0); return; }
+
+    // Blend mode
+    if (key == 'B') { blend_mode = (blend_mode + 1) % 6; return; }
+
+    // Post blur
+    if (key == 'N') { post_blur = constrain(post_blur + 0.02, 0.0, 1.0); return; }
+
+    // Post noise
+    if (key == 'M') { post_noise = constrain(post_noise + 0.002, 0.0, 0.1); return; }
+
+    // Soft clip / Sharpen
+    if (key == '<') { post_soft_clip = constrain(post_soft_clip + 0.02, 0.0, 1.0); return; }
+    if (key == '>') { post_sharpen = constrain(post_sharpen + 0.02, 0.0, 1.0); return; }
+
+    // Threshold effect
+    if (key == 'Z') { fx_threshold = constrain(fx_threshold + 0.02, 0.0, 1.0); return; }
+    if (key == 'X') { fx_threshold = constrain(fx_threshold - 0.02, 0.0, 1.0); return; }
+
+    // Pixelate
+    if (key == 'C') { fx_pixelate = constrain(fx_pixelate + 1.0, 1.0, 64.0); return; }
+    if (key == 'V') { fx_pixelate = constrain(fx_pixelate - 1.0, 1.0, 64.0); return; }
+
+    // Effects pre-feedback toggle
+    if (key == 'A') { fx_pre_fb = fx_pre_fb < 0.5 ? 1.0 : 0.0; return; }
+
+    return; // consumed shifted key
+  }
+
+  // ============================================================
+  // UNSHIFTED lowercase keys
+  // ============================================================
+
+  // Feedback amount
+  if (key == 'q') { fb_amount = constrain(fb_amount + 0.02, 0, 1); return; }
+  if (key == 'a') { fb_amount = constrain(fb_amount - 0.02, 0, 1); return; }
+
+  // Decay
+  if (key == 'w') { fb_decay = constrain(fb_decay + 0.01, 0, 1); return; }
+  if (key == 's') { fb_decay = constrain(fb_decay - 0.01, 0, 1); return; }
+
+  // Scale
+  if (key == 'e') { tf_scale = constrain(tf_scale + 0.005, 0.9, 1.1); return; }
+  if (key == 'd') { tf_scale = constrain(tf_scale - 0.005, 0.9, 1.1); return; }
+
+  // Rotation
+  if (key == 'r') { tf_rotation = constrain(tf_rotation + 0.005, -0.1, 0.1); return; }
+  if (key == 'f') { tf_rotation = constrain(tf_rotation - 0.005, -0.1, 0.1); return; }
+
+  // Hue shift
+  if (key == 't') { col_hue_shift = (col_hue_shift + 0.02) % 1.0; return; }
+  if (key == 'g') { col_hue_shift = (col_hue_shift - 0.02 + 1.0) % 1.0; return; }
+
+  // Edge type
+  if (key == 'y') { edge_type = (edge_type + 1) % 5; return; }
+  if (key == 'h') { edge_type = (edge_type - 1 + 5) % 5; return; }
+
+  // Edge mix
+  if (key == 'u') { edge_mix = constrain(edge_mix + 0.05, 0, 1); return; }
+  if (key == 'j') { edge_mix = constrain(edge_mix - 0.05, 0, 1); return; }
+
+  // Posterize
+  if (key == 'i') { fx_posterize = constrain(fx_posterize + 1, 0, 32); return; }
+  if (key == 'k') { fx_posterize = constrain(fx_posterize - 1, 0, 32); return; }
+
+  // Solarize
+  if (key == 'o') { fx_solarize = constrain(fx_solarize + 0.05, 0, 1); return; }
+  if (key == 'l') { fx_solarize = constrain(fx_solarize - 0.05, 0, 1); return; }
+
+  // Edge pre-feedback toggle
+  if (key == 'p') { edge_pre_fb = edge_pre_fb < 0.5 ? 1.0 : 0.0; return; }
+
+  // Mirror mode
+  if (key == 'm') { tf_mirror = (tf_mirror + 1) % 5; return; }
+
+  // Generator frequency
+  if (key == 'z') { gen_frequency = constrain(gen_frequency - 0.1, 0.1, 20.0); return; }
+  if (key == 'x') { gen_frequency = constrain(gen_frequency + 0.1, 0.1, 20.0); return; }
+
+  // Generator size
+  if (key == 'c') { gen_size = constrain(gen_size - 0.02, 0.0, 1.0); return; }
+  if (key == 'v') { gen_size = constrain(gen_size + 0.02, 0.0, 1.0); return; }
+
+  // Generator pos X
+  if (key == 'b') { gen_pos_x = constrain(gen_pos_x - 0.02, -1.0, 1.0); return; }
+  if (key == 'n') { gen_pos_x = constrain(gen_pos_x + 0.02, -1.0, 1.0); return; }
+}
+
+
+void resetParameters() {
+  gen_type = 1;
+  gen_frequency = 1.0;
+  gen_size = 0.3;
+  gen_pos_x = 0.0;
+  gen_pos_y = 0.0;
+  gen_softness = 0.5;
+  gen_hue = 0.0;
+  gen_intensity = 0.5;
+  gen_trigger = 0.0;
+
+  fb_amount = 0.9;
+  fb_decay = 0.98;
+  fb_tap2_amount = 0.0;
+  fb_tap2_offset = 0.0;
+  fb_delay_amount = 0.0;
+
+  tf_scale = 1.01;
+  tf_rotation = 0.01;
+  tf_translate_x = 0.0;
+  tf_translate_y = 0.0;
+  tf_mirror = 0;
+  tf_displace = 0.0;
+
+  edge_type = 0;
+  edge_mix = 0.5;
+  edge_threshold = 0.1;
+  edge_colour_mode = 0;
+  edge_pre_fb = 0;
+
+  fx_posterize = 0;
+  fx_posterize_smooth = 0.0;
+  fx_solarize = 0.0;
+  fx_solarize_soft = 0.5;
+  fx_solarize_mode = 0;
+  fx_threshold = 0.0;
+  fx_pixelate = 1.0;
+  fx_pre_fb = 0;
+
+  col_hue_shift = 0.0;
+  col_saturation = 1.0;
+  col_brightness = 0.0;
+  col_contrast = 1.0;
+  col_rgb_sep = 0.0;
+  col_invert = 0.0;
+
+  blend_mode = 0;
+
+  post_blur = 0.0;
+  post_noise = 0.0;
+  post_soft_clip = 0.0;
+  post_sharpen = 0.0;
+
+  clearBuffers();
+}
+
+
+void clearBuffers() {
+  for (int i = 0; i < 2; i++) {
+    buffers[i].beginDraw();
+    buffers[i].background(0);
+    buffers[i].endDraw();
+  }
+  delayBuffer.beginDraw();
+  delayBuffer.background(0);
+  delayBuffer.endDraw();
+  frameCounter = 0;
+}
+
+
+void applyPreset(String name) {
+  resetParameters();
+
+  if (name.equals("tunnel")) {
+    gen_type = 1;
+    gen_intensity = 0.3;
+    fb_amount = 0.95;
+    fb_decay = 0.98;
+    tf_scale = 1.02;
+    tf_rotation = 0.02;
+    col_hue_shift = 0.002;
+  } else if (name.equals("psychedelic")) {
+    gen_type = 2;  // Domain-warped noise
+    gen_intensity = 0.2;
+    gen_size = 0.4;
+    gen_softness = 0.6;
+    fb_amount = 0.9;
+    fb_decay = 0.95;
+    tf_rotation = 0.03;
+    fx_solarize = 0.5;
+    fx_solarize_mode = 1;
+    col_hue_shift = 0.01;
+    col_saturation = 1.5;
+  } else if (name.equals("glitch")) {
+    gen_type = 6;
+    gen_intensity = 0.4;
+    fb_amount = 0.85;
+    fb_decay = 0.9;
+    edge_type = 2;
+    edge_mix = 0.7;
+    edge_pre_fb = 1;
+    col_rgb_sep = 0.02;
+    fx_posterize = 6;
+    tf_displace = 0.02;  // Add displacement for extra glitch
+    fb_tap2_amount = 0.3;
+    fb_tap2_offset = 0.015;
+  } else if (name.equals("minimal")) {
+    gen_type = 5;
+    gen_intensity = 0.5;
+    fb_amount = 0.8;
+    fb_decay = 0.7;
+    tf_scale = 1.0;
+    tf_rotation = 0.0;
+    fx_posterize = 8;
+  } else if (name.equals("kaleidoscope")) {
+    gen_type = 4;
+    gen_intensity = 0.4;
+    fb_amount = 0.92;
+    fb_decay = 0.96;
+    tf_scale = 1.015;
+    tf_rotation = 0.015;
+    tf_mirror = 4;
+    col_hue_shift = 0.005;
+    col_saturation = 1.3;
+  } else if (name.equals("vhs")) {
+    gen_type = 1;
+    gen_intensity = 0.4;
+    fb_amount = 0.88;
+    fb_decay = 0.92;
+    tf_scale = 1.005;
+    tf_translate_y = 0.002;
+    col_rgb_sep = 0.015;
+    col_saturation = 0.8;
+    col_contrast = 1.2;
+    post_noise = 0.03;
+    post_blur = 0.2;
+  }
+}
+
+
+// ============================================================================
+// MIDI SETUP AND HANDLERS (pure Java javax.sound.midi)
+// ============================================================================
+
+void initMidi() {
+  try {
+    midiInfos = MidiSystem.getMidiDeviceInfo();
+    println("Available MIDI devices:");
+    for (int i = 0; i < midiInfos.length; i++) {
+      println("  [" + i + "] " + midiInfos[i].getName() + " - " + midiInfos[i].getDescription());
+    }
+
+    // Close any previously-open device
+    if (midiInputDevice != null) {
+      try { midiInputDevice.close(); } catch (Exception e) { /* ignore */ }
+      midiInputDevice = null;
+      midiTransmitter = null;
+      midiReceiver = null;
+    }
+
+    MidiDevice deviceToUse = null;
+    int chosenIndex = midiDeviceIndex;
+
+    // If user has specified an explicit index, try that first
+    if (chosenIndex >= 0 && chosenIndex < midiInfos.length) {
+      MidiDevice candidate = MidiSystem.getMidiDevice(midiInfos[chosenIndex]);
+      if (candidate.getMaxTransmitters() != 0) {
+        deviceToUse = candidate;
+      } else {
+        println("Requested MIDI device index " + chosenIndex + " has no transmitters; falling back to auto-select.");
+      }
+    }
+
+    // Auto-select: first device with a transmitter
+    if (deviceToUse == null) {
+      for (int i = 0; i < midiInfos.length; i++) {
+        MidiDevice candidate = MidiSystem.getMidiDevice(midiInfos[i]);
+        if (candidate.getMaxTransmitters() != 0) {
+          deviceToUse = candidate;
+          chosenIndex = i;
+          break;
+        }
+      }
+    }
+
+    // Open the chosen device
+    if (deviceToUse != null) {
+      deviceToUse.open();
+      midiInputDevice = deviceToUse;
+      midiTransmitter = deviceToUse.getTransmitter();
+      midiReceiver = new MidiInputReceiver();
+      midiTransmitter.setReceiver(midiReceiver);
+      midiDeviceIndex = chosenIndex;
+      println("MIDI input connected to: [" + chosenIndex + "] " + midiInfos[chosenIndex].getName());
+    }
+
+    if (midiInputDevice == null) {
+      println("No suitable MIDI input device found.");
+    }
+  } catch (Exception e) {
+    println("Error initialising MIDI: " + e.getMessage());
+    e.printStackTrace();
+  }
+}
+
+
+// Receiver that maps incoming MIDI messages to parameter changes.
+// Called from MIDI thread - writes directly to volatile float fields.
+// Float writes are atomic on ARM, so individual parameter reads in draw()
+// will always see a complete value (no torn reads).
+class MidiInputReceiver implements Receiver {
+  public void send(MidiMessage message, long timeStamp) {
+    if (message instanceof ShortMessage) {
+      ShortMessage sm = (ShortMessage) message;
+      int command = sm.getCommand();
+      int data1 = sm.getData1();
+      int data2 = sm.getData2();
+
+      if (command == ShortMessage.CONTROL_CHANGE) {
+        float norm = data2 / 127.0;
+        handleControllerChange(data1, norm);
+      } else if (command == ShortMessage.NOTE_ON && data2 > 0) {
+        gen_trigger = data2 / 127.0;
+      }
+    }
+  }
+
+  public void close() {
+    // Outer sketch handles device close
+  }
+}
+
+
+// Map MIDI CC to shader parameters
+void handleControllerChange(int number, float norm) {
+  switch(number) {
+    // Generator
+    case 1:  gen_type      = (int)(norm * 7); break;
+    case 2:  gen_frequency = 0.1 + norm * 19.9; break;
+    case 3:  gen_size      = norm; break;
+    case 4:  gen_pos_x     = norm * 2.0 - 1.0; break;
+    case 5:  gen_pos_y     = norm * 2.0 - 1.0; break;
+    case 6:  gen_softness  = norm; break;
+    case 7:  gen_hue       = norm; break;
+    case 8:  gen_intensity = norm; break;
+
+    // Feedback
+    case 10: fb_amount     = norm; break;
+    case 11: fb_decay      = norm; break;
+
+    // Transform
+    case 12: tf_scale      = 0.9 + norm * 0.2; break;
+    case 13: tf_rotation   = (norm - 0.5) * 0.2; break;
+    case 14: tf_translate_x = (norm - 0.5) * 0.2; break;
+    case 15: tf_translate_y = (norm - 0.5) * 0.2; break;
+    case 16: tf_mirror     = (int)(norm * 4); break;
+
+    // Edge detection
+    case 17: edge_type        = (int)(norm * 4); break;
+    case 18: edge_mix         = norm; break;
+    case 19: edge_threshold   = norm; break;
+    case 20: edge_colour_mode = (int)(norm * 2); break;
+    case 21: edge_pre_fb      = norm > 0.5 ? 1.0 : 0.0; break;
+
+    // Effects
+    case 22: fx_posterize         = norm * 32.0; break;
+    case 23: fx_posterize_smooth  = norm; break;
+    case 24: fx_solarize          = norm; break;
+    case 25: fx_solarize_soft     = norm; break;
+    case 26: fx_solarize_mode     = (int)(norm * 2); break;
+    case 27: fx_threshold         = norm; break;
+    case 28: fx_pixelate          = 1.0 + norm * 63.0; break;
+    case 29: fx_pre_fb            = norm > 0.5 ? 1.0 : 0.0; break;
+
+    // Colour
+    case 30: col_hue_shift  = norm; break;
+    case 31: col_saturation = norm * 2.0; break;
+    case 32: col_brightness = norm - 0.5; break;
+    case 33: col_contrast   = 0.5 + norm * 1.5; break;
+    case 34: col_rgb_sep    = norm * 0.05; break;
+    case 35: col_invert     = norm; break;
+
+    // Blend
+    case 36: blend_mode = (int)(norm * 5); break;
+
+    // Post
+    case 37: post_blur      = norm; break;
+    case 38: post_noise     = norm * 0.1; break;
+    case 39: post_soft_clip = norm; break;
+    case 40: post_sharpen   = norm; break;
+
+    // New parameters
+    case 41: tf_displace       = norm * 0.1; break;
+    case 42: fb_tap2_amount    = norm; break;
+    case 43: fb_tap2_offset    = (norm - 0.5) * 0.2; break;
+    case 44: fb_delay_amount   = norm; break;
+  }
+}
