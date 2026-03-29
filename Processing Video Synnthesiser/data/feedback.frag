@@ -551,15 +551,12 @@ vec3 processColour(vec3 col) {
 }
 
 vec3 applyRGBSeparation(vec2 uv, sampler2D tex) {
-    // Branchless: when sep is 0, all three sample the same UV (no visual change)
-    float sep = u_col_rgb_sep;
-    float doSep = step(0.001, sep);
-    float offset = sep * doSep;
-
-    float r = texture2D(tex, uv + vec2(offset, 0.0)).r;
+    if (u_col_rgb_sep < 0.001) {
+        return texture2D(tex, uv).rgb;
+    }
+    float r = texture2D(tex, uv + vec2(u_col_rgb_sep, 0.0)).r;
     float g = texture2D(tex, uv).g;
-    float b = texture2D(tex, uv - vec2(offset, 0.0)).b;
-
+    float b = texture2D(tex, uv - vec2(u_col_rgb_sep, 0.0)).b;
     return vec3(r, g, b);
 }
 
@@ -595,26 +592,21 @@ vec3 blendColours(vec3 generator, vec3 feedback) {
 // ============================================================================
 
 vec3 postProcess(vec3 col, vec2 uv) {
-    // Determine if we need neighbour samples at all
-    // Blur and sharpen both need the same 4 cardinal neighbours
-    float needSamples = step(0.01, u_post_blur) + step(0.01, u_post_sharpen);
+    // Only sample neighbours when blur or sharpen is actually active.
+    // On Pi 3 this saves ~4 texture samples per pixel at default settings.
+    if (u_post_blur > 0.01 || u_post_sharpen > 0.01) {
+        float blurSize = max(u_post_blur * 3.0, 1.0);
+        vec3 nR = texture2D(u_feedback, uv + vec2(px.x, 0.0) * blurSize).rgb;
+        vec3 nL = texture2D(u_feedback, uv - vec2(px.x, 0.0) * blurSize).rgb;
+        vec3 nU = texture2D(u_feedback, uv + vec2(0.0, px.y) * blurSize).rgb;
+        vec3 nD = texture2D(u_feedback, uv - vec2(0.0, px.y) * blurSize).rgb;
+        vec3 avg = (col + nR + nL + nU + nD) / 5.0;
 
-    // Sample neighbours once, shared between blur and sharpen
-    // When neither is active, these reads still happen but the result is discarded
-    // via mix(col, ..., 0.0). On Pi 3 this is cheaper than branching + pipeline stall.
-    float blurSize = max(u_post_blur * 3.0, 1.0);
-    vec3 nR = texture2D(u_feedback, uv + vec2(px.x, 0.0) * blurSize).rgb;
-    vec3 nL = texture2D(u_feedback, uv - vec2(px.x, 0.0) * blurSize).rgb;
-    vec3 nU = texture2D(u_feedback, uv + vec2(0.0, px.y) * blurSize).rgb;
-    vec3 nD = texture2D(u_feedback, uv - vec2(0.0, px.y) * blurSize).rgb;
-    vec3 avg = (col + nR + nL + nU + nD) / 5.0;
+        col = mix(col, avg, u_post_blur);
 
-    // Blur: mix toward average
-    col = mix(col, avg, u_post_blur * step(0.01, u_post_blur));
-
-    // Sharpen: unsharp mask = original + (original - blurred) * amount
-    vec3 sharpened = col + (col - avg) * u_post_sharpen * 2.0;
-    col = mix(col, sharpened, step(0.01, u_post_sharpen));
+        vec3 sharpened = col + (col - avg) * u_post_sharpen * 2.0;
+        col = mix(col, sharpened, step(0.01, u_post_sharpen));
+    }
 
     // Noise (branchless)
     float n = hash(uv * u_resolution + u_time * 1000.0) - 0.5;
@@ -656,42 +648,38 @@ void main() {
     // -------------------------------------------------------------------------
     // 1a. UV Displacement from feedback luminance
     // -------------------------------------------------------------------------
-    // Compute luminance and use it to offset UV, then re-sample
-    // When u_tf_displace is 0, displaced_uv == fb_uv (no visual change)
-    float fb_lum = luminance(feedback);
-    vec2 displaced_uv = fb_uv + (fb_lum - 0.5) * u_tf_displace;
-    displaced_uv = fract(displaced_uv);
-    // Re-sample feedback at displaced position (adds up to 3 texture samples for RGB sep)
-    feedback = applyRGBSeparation(displaced_uv, u_feedback);
+    if (u_tf_displace > 0.001) {
+        float fb_lum = luminance(feedback);
+        vec2 displaced_uv = fract(fb_uv + (fb_lum - 0.5) * u_tf_displace);
+        feedback = applyRGBSeparation(displaced_uv, u_feedback);
+    }
 
     // -------------------------------------------------------------------------
     // 1b. Multiple feedback taps
     // -------------------------------------------------------------------------
-    // Second feedback tap with offset rotation
-    // Compute fb_uv2 with additional rotation offset
-    vec2 centered2 = pixUV - 0.5;
-    centered2 /= u_tf_scale;
-    float totalRot = u_tf_rotation + u_fb_tap2_offset;
-    float s2 = sin(totalRot);
-    float c2 = cos(totalRot);
-    centered2 = vec2(
-        centered2.x * c2 - centered2.y * s2,
-        centered2.x * s2 + centered2.y * c2
-    );
-    centered2 -= vec2(u_tf_translate_x, u_tf_translate_y);
-    vec2 fb_uv2 = centered2 + 0.5;
-    fb_uv2 = applyMirror(fb_uv2);
-    fb_uv2 = fract(fb_uv2);
-    vec3 feedback2 = texture2D(u_feedback, fb_uv2).rgb;
-    // Blend second tap (when amount is 0, this is branchless no-op)
-    feedback = mix(feedback, feedback2, u_fb_tap2_amount);
+    if (u_fb_tap2_amount > 0.01) {
+        vec2 centered2 = pixUV - 0.5;
+        centered2 /= u_tf_scale;
+        float totalRot = u_tf_rotation + u_fb_tap2_offset;
+        float s2 = sin(totalRot);
+        float c2 = cos(totalRot);
+        centered2 = vec2(
+            centered2.x * c2 - centered2.y * s2,
+            centered2.x * s2 + centered2.y * c2
+        );
+        centered2 -= vec2(u_tf_translate_x, u_tf_translate_y);
+        vec2 fb_uv2 = fract(applyMirror(centered2 + 0.5));
+        vec3 feedback2 = texture2D(u_feedback, fb_uv2).rgb;
+        feedback = mix(feedback, feedback2, u_fb_tap2_amount);
+    }
 
     // -------------------------------------------------------------------------
     // 1c. Long-delay feedback buffer
     // -------------------------------------------------------------------------
-    // Blend in the delay buffer (sampled at same UV as primary feedback)
-    vec3 delayed = texture2D(u_delay_feedback, fb_uv).rgb;
-    feedback = mix(feedback, delayed, u_fb_delay_amount);
+    if (u_fb_delay_amount > 0.01) {
+        vec3 delayed = texture2D(u_delay_feedback, fb_uv).rgb;
+        feedback = mix(feedback, delayed, u_fb_delay_amount);
+    }
 
     // -------------------------------------------------------------------------
     // 2. Apply pre-feedback edge detection (if enabled)
