@@ -157,9 +157,12 @@ float post_soft_clip = 0.0;
 float post_sharpen = 0.0;
 
 
-void setup() {
+void settings() {
   size(1280, 720, P2D);
-  surface.setResizable(true);
+  noSmooth();
+}
+
+void setup() {
 
   // Target 30fps - matches Pi 3 capability, reduces CPU/GPU thrash
   frameRate(30);
@@ -169,8 +172,11 @@ void setup() {
 
   // Create ping-pong buffers at reduced render resolution
   buffers[0] = createGraphics(RENDER_W, RENDER_H, P2D);
+  buffers[0].noSmooth();
   buffers[1] = createGraphics(RENDER_W, RENDER_H, P2D);
+  buffers[1].noSmooth();
   delayBuffer = createGraphics(RENDER_W, RENDER_H, P2D);
+  delayBuffer.noSmooth();
 
   // Clear buffers
   clearBuffers();
@@ -180,7 +186,7 @@ void setup() {
   if (imageFiles.size() > 0) loadImageByIndex(0);
 
   // Initialise MIDI via MidiHandler
-  midiHandler = new MidiHandler(this, 6);
+  midiHandler = new MidiHandler(this, 3);
   midiHandler.init();
 
   println("Feedback Shader Test - Pi 3 Optimised");
