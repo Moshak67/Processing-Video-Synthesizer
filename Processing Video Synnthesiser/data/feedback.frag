@@ -242,179 +242,126 @@ vec3 generateSource(vec2 uv, vec2 fb_uv) {
     float t = u_time * u_gen_frequency;
     float dist = length(centered);
     float r = u_gen_size * 0.4;
-    float sf = u_gen_softness * 0.1 + 0.001;
 
-    // Generator colour from hue
     vec3 genColour = hsv2rgb(vec3(u_gen_hue, 0.8, 1.0));
+    float v = 0.0;
+    vec3 col = vec3(0.0);
 
-    // Type selection masks
-    float t1 = step(0.5, u_gen_type) * step(u_gen_type, 1.5);  // voronoi
-    float t2 = step(1.5, u_gen_type) * step(u_gen_type, 2.5);  // domain-warped noise
-    float t3 = step(2.5, u_gen_type) * step(u_gen_type, 3.5);  // noise (unchanged)
-    float t4 = step(3.5, u_gen_type) * step(u_gen_type, 4.5);  // diagonal stripes
-    float t5 = step(4.5, u_gen_type) * step(u_gen_type, 5.5);  // reaction-diffusion
-    float t6 = step(5.5, u_gen_type) * step(u_gen_type, 6.5);  // moire (type 6 only)
-    float t7 = step(6.5, u_gen_type);                           // image sampler (type 7)
+    if (u_gen_type < 0.5) {
+        // 0: off
+        col = vec3(0.0);
 
-    // 1. Voronoi / Cellular
-    // Tile-based nearest-point distance field with animated cell centres
-    float cellScale = 2.0 + u_gen_size * 10.0;
-    vec2 cellUV = uv * cellScale;
-    vec2 cellID = floor(cellUV);
-    vec2 cellPos = fract(cellUV);
-
-    float minDist = 1.0;
-    // 3x3 neighbour search for nearest cell centre
-    for (float y = -1.0; y <= 1.0; y += 1.0) {
-        for (float x = -1.0; x <= 1.0; x += 1.0) {
-            vec2 neighbour = vec2(x, y);
-            vec2 nID = cellID + neighbour;
-            // Random point in neighbouring cell (animated by frequency)
-            vec2 point = vec2(hash(nID), hash(nID + vec2(13.7, 27.3)));
-            point = 0.5 + 0.4 * sin(point * 6.28318 + t);
-            vec2 diff = neighbour + point - cellPos;
-            float d = length(diff);
-            minDist = min(minDist, d);
+    } else if (u_gen_type < 1.5) {
+        // 1: Voronoi / Cellular
+        float cellScale = 2.0 + u_gen_size * 10.0;
+        vec2 cellUV = uv * cellScale;
+        vec2 cellID = floor(cellUV);
+        vec2 cellPos = fract(cellUV);
+        float minDist = 1.0;
+        for (float y = -1.0; y <= 1.0; y += 1.0) {
+            for (float x = -1.0; x <= 1.0; x += 1.0) {
+                vec2 neighbour = vec2(x, y);
+                vec2 nID = cellID + neighbour;
+                vec2 point = vec2(hash(nID), hash(nID + vec2(13.7, 27.3)));
+                point = 0.5 + 0.4 * sin(point * 6.28318 + t);
+                vec2 diff = neighbour + point - cellPos;
+                float d = length(diff);
+                minDist = min(minDist, d);
+            }
         }
+        v = smoothstep(0.0, u_gen_softness * 0.5 + 0.001, minDist);
+        col = genColour * v;
+
+    } else if (u_gen_type < 2.5) {
+        // 2: Domain-Warped Noise
+        float baseScale = 2.0 + u_gen_size * 8.0;
+        float warpAmount = u_gen_softness * 2.0;
+        vec2 warp = vec2(
+            fbm(uv * baseScale + t * 0.5),
+            fbm(uv * baseScale + t * 0.5 + vec2(5.2, 1.3))
+        );
+        v = smoothstep(0.4, 0.6, fbm(uv * baseScale + warp * warpAmount + t));
+        col = genColour * v;
+
+    } else if (u_gen_type < 3.5) {
+        // 3: Outlined Shapes (circle, rectangle, diamond)
+        float shapeType = mod(floor(u_gen_frequency * 0.5), 3.0);
+        float thickness = u_gen_softness * 0.08 + 0.005;
+
+        float circleRingDist = abs(dist - r);
+        float circleOutline = 1.0 - smoothstep(0.0, thickness, circleRingDist);
+
+        vec2 rectDist = abs(centered) - vec2(r);
+        float rectEdgeDist = length(max(rectDist, 0.0)) + min(max(rectDist.x, rectDist.y), 0.0);
+        float rectOutline = 1.0 - smoothstep(0.0, thickness, abs(rectEdgeDist));
+
+        float diamondRingDist = abs(abs(centered.x) + abs(centered.y) - r);
+        float diamondOutline = 1.0 - smoothstep(0.0, thickness, diamondRingDist);
+
+        float isCircle  = step(shapeType, 0.5);
+        float isRect    = step(0.5, shapeType) * step(shapeType, 1.5);
+        float isDiamond = step(1.5, shapeType);
+
+        v = circleOutline * isCircle + rectOutline * isRect + diamondOutline * isDiamond;
+        col = genColour * v;
+
+    } else if (u_gen_type < 4.5) {
+        // 4: Diagonal Stripes / Grid
+        float stripeSpacing = 5.0 + u_gen_size * 30.0;
+        float angle = t * 0.5;
+        vec2 dir = vec2(cos(angle), sin(angle));
+        float stripe1 = sin(dot(centered, dir) * stripeSpacing);
+        vec2 dirPerp = vec2(-dir.y, dir.x);
+        float stripe2 = sin(dot(centered, dirPerp) * stripeSpacing) * 0.5;
+        float stripePattern = (stripe1 + stripe2) * 0.5 + 0.5;
+        v = smoothstep(0.5 - u_gen_softness * 0.3, 0.5 + u_gen_softness * 0.3, stripePattern);
+        col = genColour * v;
+
+    } else if (u_gen_type < 5.5) {
+        // 5: Reaction-Diffusion Seed
+        vec3 centre = texture2D(u_feedback, uv).rgb;
+        float c = luminance(centre);
+        float n1 = luminance(texture2D(u_feedback, uv + vec2(px.x, 0.0)).rgb);
+        float n2 = luminance(texture2D(u_feedback, uv - vec2(px.x, 0.0)).rgb);
+        float n3 = luminance(texture2D(u_feedback, uv + vec2(0.0, px.y)).rgb);
+        float n4 = luminance(texture2D(u_feedback, uv - vec2(0.0, px.y)).rgb);
+        float d1 = luminance(texture2D(u_feedback, uv + vec2(px.x, px.y)).rgb);
+        float d2 = luminance(texture2D(u_feedback, uv - vec2(px.x, px.y)).rgb);
+        float d3 = luminance(texture2D(u_feedback, uv + vec2(px.x, -px.y)).rgb);
+        float d4 = luminance(texture2D(u_feedback, uv - vec2(px.x, -px.y)).rgb);
+        float neighbors = (n1 + n2 + n3 + n4) * 0.25;
+        float neighbors_all = (n1 + n2 + n3 + n4 + d1 + d2 + d3 + d4) * 0.125;
+        float noise = fbm(uv * (5.0 + u_gen_size * 15.0) + t * u_gen_frequency * 0.2);
+        float excitation = neighbors_all - c;
+        float growthZone = smoothstep(0.0, 0.2, neighbors) * smoothstep(0.8, 0.6, neighbors);
+        float diffused = mix(c, neighbors_all, u_gen_softness);
+        float seed = noise * (1.0 - smoothstep(0.0, 0.3, c));
+        float reaction = growthZone * 0.3 + excitation * u_gen_softness * 0.2;
+        float decay = c * u_gen_frequency * 0.02;
+        v = clamp(diffused + reaction + seed * 0.5 - decay, 0.0, 1.0);
+        col = genColour * v;
+
+    } else if (u_gen_type < 6.5) {
+        // 6: Moire
+        float scale1 = 20.0 + u_gen_size * 40.0;
+        float scale2 = scale1 * 1.1;
+        float p1 = sin(centered.x * scale1 + t) * sin(centered.y * scale1);
+        float p2 = sin(centered.x * scale2 - t * 0.7) * sin(centered.y * scale2);
+        v = smoothstep(0.5 - u_gen_softness * 0.3, 0.5 + u_gen_softness * 0.3,
+                       (p1 + p2) * 0.5 + 0.5);
+        col = genColour * v;
+
+    } else {
+        // 7: Image sampler
+        float imgZoom = max(u_gen_size * 2.0, 0.01);
+        vec2 imgUV = clamp(centered / imgZoom + 0.5, 0.0, 1.0);
+        vec3 imgRaw = texture2D(u_gen_image, imgUV).rgb;
+        vec3 imgHSV = rgb2hsv(imgRaw);
+        imgHSV.x = fract(imgHSV.x + u_gen_hue);
+        col = hsv2rgb(imgHSV);
     }
-    float v1 = smoothstep(0.0, u_gen_softness * 0.5 + 0.001, minDist);
 
-    // 2. Domain-Warped Noise
-    // Feed noise output as UV offset for second noise pass
-    float baseScale = 2.0 + u_gen_size * 8.0;
-    float warpAmount = u_gen_softness * 2.0;
-    vec2 warp = vec2(
-        fbm(uv * baseScale + t * 0.5),
-        fbm(uv * baseScale + t * 0.5 + vec2(5.2, 1.3))
-    );
-    float v2 = smoothstep(0.4, 0.6,
-                          fbm(uv * baseScale + warp * warpAmount + t));
-
-    // 3. Outlined Shapes (circle, rectangle, diamond)
-    // Use frequency to select shape type and animate
-    float shapeType = mod(floor(u_gen_frequency * 0.5), 3.0);  // 0=circle, 1=rect, 2=diamond
-    float thickness = u_gen_softness * 0.08 + 0.005;  // outline thickness
-    float shapeSize = r;  // reuse radius calculation
-
-    // Circle outline - HOLLOW ring only
-    // Distance from the circle radius (0 when exactly on the circle)
-    float circleRingDist = abs(dist - shapeSize);
-    // Show only when close to the ring (inverted smoothstep)
-    float circleOutline = 1.0 - smoothstep(0.0, thickness, circleRingDist);
-
-    // Rectangle outline - HOLLOW edges only
-    vec2 rectDist = abs(centered) - vec2(shapeSize);
-    float rectEdgeDist = length(max(rectDist, 0.0)) + min(max(rectDist.x, rectDist.y), 0.0);
-    // Distance from rectangle edge (0 when exactly on edge)
-    float rectRingDist = abs(rectEdgeDist);
-    float rectOutline = 1.0 - smoothstep(0.0, thickness, rectRingDist);
-
-    // Diamond outline - HOLLOW edges only
-    // Manhattan distance gives diamond shape
-    float diamondDist = abs(centered.x) + abs(centered.y) - shapeSize;
-    float diamondRingDist = abs(diamondDist);
-    float diamondOutline = 1.0 - smoothstep(0.0, thickness, diamondRingDist);
-
-    // Select shape based on frequency parameter
-    float isCircle = step(shapeType, 0.5);
-    float isRect = step(0.5, shapeType) * step(shapeType, 1.5);
-    float isDiamond = step(1.5, shapeType);
-
-    float v3 = circleOutline * isCircle + rectOutline * isRect + diamondOutline * isDiamond;
-
-    // 4. Diagonal Stripes / Grid
-    // Rotating stripes with controllable angle and softness
-    float stripeSpacing = 5.0 + u_gen_size * 30.0;
-    float angle = t * 0.5;
-    vec2 dir = vec2(cos(angle), sin(angle));
-    float stripe1 = sin(dot(centered, dir) * stripeSpacing);
-    // Add perpendicular stripe at half intensity for grid effect
-    vec2 dirPerp = vec2(-dir.y, dir.x);
-    float stripe2 = sin(dot(centered, dirPerp) * stripeSpacing) * 0.5;
-    float stripePattern = (stripe1 + stripe2) * 0.5 + 0.5;
-    float v4 = smoothstep(0.5 - u_gen_softness * 0.3, 0.5 + u_gen_softness * 0.3, stripePattern);
-
-    // 5. Reaction-Diffusion Seed
-    // Simplified organic growth pattern inspired by reaction-diffusion
-    // Reads feedback and applies local rules to create evolving organic patterns
-
-    // Sample center and neighbors from feedback
-    vec3 centre = texture2D(u_feedback, uv).rgb;
-    float c = luminance(centre);
-
-    float n1 = luminance(texture2D(u_feedback, uv + vec2(px.x, 0.0)).rgb);
-    float n2 = luminance(texture2D(u_feedback, uv - vec2(px.x, 0.0)).rgb);
-    float n3 = luminance(texture2D(u_feedback, uv + vec2(0.0, px.y)).rgb);
-    float n4 = luminance(texture2D(u_feedback, uv - vec2(0.0, px.y)).rgb);
-
-    // Also sample diagonals for richer patterns
-    float d1 = luminance(texture2D(u_feedback, uv + vec2(px.x, px.y)).rgb);
-    float d2 = luminance(texture2D(u_feedback, uv - vec2(px.x, px.y)).rgb);
-    float d3 = luminance(texture2D(u_feedback, uv + vec2(px.x, -px.y)).rgb);
-    float d4 = luminance(texture2D(u_feedback, uv - vec2(px.x, -px.y)).rgb);
-
-    // Compute neighbor average and variance
-    float neighbors = (n1 + n2 + n3 + n4) * 0.25;
-    float neighbors_all = (n1 + n2 + n3 + n4 + d1 + d2 + d3 + d4) * 0.125;
-
-    // Noise for seeding and randomness (stronger)
-    float noise = fbm(uv * (5.0 + u_gen_size * 15.0) + t * u_gen_frequency * 0.2);
-
-    // Compute excitation (how active neighbors are)
-    float excitation = (neighbors_all - c);  // positive if neighbors brighter than center
-
-    // Growth rules (cellular automaton style)
-    float threshold = 0.2 + u_gen_size * 0.3;  // sweet spot for growth
-    float growthZone = smoothstep(0.0, 0.2, neighbors) * smoothstep(0.8, 0.6, neighbors);
-
-    // Diffusion with neighbors (controlled by softness)
-    float diffused = mix(c, neighbors_all, u_gen_softness);
-
-    // Strong noise seed to get things started
-    float seed = noise * (1.0 - smoothstep(0.0, 0.3, c));  // seed where dark
-
-    // Reaction term: grow in the sweet spot, strengthen existing bright areas
-    float reaction = growthZone * 0.3 + excitation * u_gen_softness * 0.2;
-
-    // Decay based on frequency (prevents runaway brightness)
-    float decay = c * u_gen_frequency * 0.02;
-
-    // Combine all terms
-    float v5 = diffused + reaction + seed * 0.5 - decay;
-
-    v5 = clamp(v5, 0.0, 1.0);
-
-    // 6. Moire (unchanged from original)
-    float scale1 = 20.0 + u_gen_size * 40.0;
-    float scale2 = scale1 * 1.1;
-    float p1 = sin(centered.x * scale1 + t) * sin(centered.y * scale1);
-    float p2 = sin(centered.x * scale2 - t * 0.7) * sin(centered.y * scale2);
-    float v6 = smoothstep(0.5 - u_gen_softness * 0.3, 0.5 + u_gen_softness * 0.3,
-                           (p1 + p2) * 0.5 + 0.5);
-
-    // 7. Image sampler
-    // gen_size controls zoom (0.5 = fill screen, lower = zoom in, higher = zoom out)
-    // gen_pos_x/y pans the image via 'centered' which already includes position offset
-    float imgZoom = max(u_gen_size * 2.0, 0.01);      // 0.5 default → 1.0 = fill screen
-    vec2 imgUV = centered / imgZoom + 0.5;             // reuse existing 'centered' var
-    imgUV = clamp(imgUV, 0.0, 1.0);                    // clamp: no tiling, black border on overrun
-    vec3 imgRaw = texture2D(u_gen_image, imgUV).rgb;
-
-    // Apply hue shift
-    vec3 imgHSV = rgb2hsv(imgRaw);
-    imgHSV.x = fract(imgHSV.x + u_gen_hue);
-    vec3 v7_col = hsv2rgb(imgHSV);
-
-    // Branchless weighted sum
-    float v = v1*t1 + v2*t2 + v3*t3 + v4*t4 + v5*t5 + v6*t6;
-
-    vec3 col = genColour * v;
-    col = mix(col, v7_col, t7);   // branchless: replace with image when type 7
-
-    // Apply trigger flash
     col += vec3(u_gen_trigger);
-
-    // Apply intensity
     col *= u_gen_intensity;
 
     return col;
