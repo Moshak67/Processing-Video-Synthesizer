@@ -164,8 +164,10 @@ void settings() {
 
 void setup() {
 
-  // Target 30fps - matches Pi 3 capability, reduces CPU/GPU thrash
-  frameRate(30);
+  // Set high so JOGL's animator doesn't sleep between frames.
+  // On Pi 3, Thread.sleep() has ~100ms resolution; any sleep target causes ~10fps.
+  // With frameRate(120), calculated sleep is negative → no sleep → vsync throttles.
+  frameRate(120);
 
   // Load shader
   feedbackShader = loadShader("feedback.frag", "passthrough.vert");
@@ -208,6 +210,8 @@ void setup() {
 }
 
 
+long _prevDrawEnd = 0;
+
 void draw() {
   // Swap buffers
   int prev = currentBuffer;
@@ -215,6 +219,7 @@ void draw() {
 
   // --- TIMING DIAGNOSTIC (remove after profiling) ---
   long t0 = System.currentTimeMillis();
+  long gap = (_prevDrawEnd > 0) ? (t0 - _prevDrawEnd) : 0;
 
   // Update shader uniforms
   updateShaderUniforms(prev);
@@ -250,8 +255,9 @@ void draw() {
   long t4 = System.currentTimeMillis();
 
   // --- TIMING DIAGNOSTIC (remove after profiling) ---
+  _prevDrawEnd = System.currentTimeMillis();
   if (frameCount % 30 == 0) {
-    println("uniforms=" + (t1-t0) + "ms  shader=" + (t2-t1) + "ms  delay=" + (t3-t2) + "ms  blit=" + (t4b-t3) + "ms  hud=" + (t4-t4b) + "ms  total=" + (t4-t0) + "ms  fps=" + nf(frameRate,0,1));
+    println("gap=" + gap + "ms  uniforms=" + (t1-t0) + "ms  shader=" + (t2-t1) + "ms  delay=" + (t3-t2) + "ms  blit=" + (t4b-t3) + "ms  hud=" + (t4-t4b) + "ms  total=" + (t4-t0) + "ms  fps=" + nf(frameRate,0,1));
   }
 }
 
