@@ -82,8 +82,8 @@ PGraphics delayBuffer; // Long-delay feedback buffer
 int frameCounter = 0;  // For delay buffer update timing
 
 // Render resolution (independent of window size for Pi 3 performance)
-final int RENDER_W = 480;
-final int RENDER_H = 270;
+final int RENDER_W = 320;
+final int RENDER_H = 180;
 
 // HUD control
 boolean showHUD = true;

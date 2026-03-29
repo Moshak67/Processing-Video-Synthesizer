@@ -178,29 +178,24 @@ vec3 tanhApprox(vec3 x) {
 // ============================================================================
 
 vec2 applyMirror(vec2 uv) {
-    // Branchless mirror mode selection using step() masks
-    float isH   = step(0.5, u_tf_mirror) * step(u_tf_mirror, 1.5);  // mode 1
-    float isV   = step(1.5, u_tf_mirror) * step(u_tf_mirror, 2.5);  // mode 2
-    float isQ   = step(2.5, u_tf_mirror) * step(u_tf_mirror, 3.5);  // mode 3
-    float isK   = step(3.5, u_tf_mirror);                            // mode 4
+    if (u_tf_mirror < 0.5) return uv;  // mode 0: off — skip all trig
 
-    // Horizontal mirror (modes 1, 3)
-    float doH = max(isH, isQ);
-    uv.x = mix(uv.x, abs(uv.x - 0.5) + 0.5, doH);
+    if (u_tf_mirror > 3.5) {
+        // mode 4: kaleidoscope — only trig when actually used
+        vec2 centered = uv - 0.5;
+        float angle = atan(centered.y, centered.x);
+        float segments = 6.0;
+        angle = mod(angle, 6.28318 / segments);
+        angle = abs(angle - 3.14159 / segments);
+        float radius = length(centered);
+        return vec2(cos(angle), sin(angle)) * radius + 0.5;
+    }
 
-    // Vertical mirror (modes 2, 3)
-    float doV = max(isV, isQ);
-    uv.y = mix(uv.y, abs(uv.y - 0.5) + 0.5, doV);
-
-    // Kaleidoscope (mode 4) - compute unconditionally, blend via isK
-    vec2 centered = uv - 0.5;
-    float angle = atan(centered.y, centered.x);
-    float segments = 6.0;
-    angle = mod(angle, 6.28318 / segments);
-    angle = abs(angle - 3.14159 / segments);
-    float radius = length(centered);
-    vec2 kalUV = vec2(cos(angle), sin(angle)) * radius + 0.5;
-    uv = mix(uv, kalUV, isK);
+    // mode 1: H,  mode 2: V,  mode 3: quad (H+V)
+    if (u_tf_mirror < 1.5 || u_tf_mirror > 2.5)   // modes 1 and 3
+        uv.x = abs(uv.x - 0.5) + 0.5;
+    if (u_tf_mirror > 1.5)                         // modes 2 and 3
+        uv.y = abs(uv.y - 0.5) + 0.5;
 
     return uv;
 }
@@ -526,26 +521,23 @@ vec3 applyEffects(vec3 col) {
 // ============================================================================
 
 vec3 processColour(vec3 col) {
-    // Convert to HSV for hue/sat manipulation
-    vec3 hsv = rgb2hsv(col);
+    // Skip the expensive HSV round-trip when hue and saturation are at defaults
+    bool needHSV = (u_col_hue_shift > 0.001 || abs(u_col_saturation - 1.0) > 0.001);
+    if (needHSV) {
+        vec3 hsv = rgb2hsv(col);
+        hsv.x = fract(hsv.x + u_col_hue_shift);
+        hsv.y = clamp(hsv.y * u_col_saturation, 0.0, 1.0);
+        col = hsv2rgb(hsv);
+    }
 
-    // Hue shift
-    hsv.x = fract(hsv.x + u_col_hue_shift);
+    if (abs(u_col_brightness) > 0.001)
+        col += u_col_brightness;
 
-    // Saturation
-    hsv.y = clamp(hsv.y * u_col_saturation, 0.0, 1.0);
+    if (abs(u_col_contrast - 1.0) > 0.001)
+        col = (col - 0.5) * u_col_contrast + 0.5;
 
-    // Convert back to RGB
-    col = hsv2rgb(hsv);
-
-    // Brightness
-    col += u_col_brightness;
-
-    // Contrast (around 0.5 midpoint)
-    col = (col - 0.5) * u_col_contrast + 0.5;
-
-    // Inversion
-    col = mix(col, 1.0 - col, u_col_invert);
+    if (u_col_invert > 0.001)
+        col = mix(col, 1.0 - col, u_col_invert);
 
     return clamp(col, 0.0, 1.0);
 }
@@ -566,24 +558,20 @@ vec3 applyRGBSeparation(vec2 uv, sampler2D tex) {
 // ============================================================================
 
 vec3 blendColours(vec3 generator, vec3 feedback) {
-    // Mode masks
-    float m0 = step(u_blend_mode, 0.5);                                    // mix
-    float m1 = step(0.5, u_blend_mode) * step(u_blend_mode, 1.5);         // add
-    float m2 = step(1.5, u_blend_mode) * step(u_blend_mode, 2.5);         // multiply
-    float m3 = step(2.5, u_blend_mode) * step(u_blend_mode, 3.5);         // screen
-    float m4 = step(3.5, u_blend_mode) * step(u_blend_mode, 4.5);         // difference
-    float m5 = step(4.5, u_blend_mode);                                    // overlay
-
-    vec3 rMix    = mix(feedback, generator, u_gen_intensity);
-    vec3 rAdd    = feedback + generator;
-    vec3 rMul    = feedback * (generator + 0.5);
-    vec3 rScreen = 1.0 - (1.0 - feedback) * (1.0 - generator);
-    vec3 rDiff   = abs(feedback - generator);
-    vec3 rOvLow  = 2.0 * feedback * generator;
-    vec3 rOvHigh = 1.0 - 2.0 * (1.0 - feedback) * (1.0 - generator);
-    vec3 rOvr    = mix(rOvLow, rOvHigh, step(0.5, feedback));
-
-    return rMix * m0 + rAdd * m1 + rMul * m2 + rScreen * m3 + rDiff * m4 + rOvr * m5;
+    if (u_blend_mode < 0.5)
+        return mix(feedback, generator, u_gen_intensity);
+    if (u_blend_mode < 1.5)
+        return feedback + generator;
+    if (u_blend_mode < 2.5)
+        return feedback * (generator + 0.5);
+    if (u_blend_mode < 3.5)
+        return 1.0 - (1.0 - feedback) * (1.0 - generator);
+    if (u_blend_mode < 4.5)
+        return abs(feedback - generator);
+    // overlay
+    vec3 low  = 2.0 * feedback * generator;
+    vec3 high = 1.0 - 2.0 * (1.0 - feedback) * (1.0 - generator);
+    return mix(low, high, step(0.5, feedback));
 }
 
 
