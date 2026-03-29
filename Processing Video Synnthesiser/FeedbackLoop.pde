@@ -72,14 +72,8 @@
 //   TAB            : Toggle HUD display
 // ============================================================================
 
-// MIDI via pure Java javax.sound.midi (no external libs)
-import javax.sound.midi.*;
-
-MidiDevice midiInputDevice;
-Transmitter midiTransmitter;
-Receiver midiReceiver;
-MidiDevice.Info[] midiInfos;
-int midiDeviceIndex = 6; // set to 0..N-1 to force a specific device, or -1 for auto
+// MIDI handled via MidiHandler.java (pure Java, bypasses Processing preprocessor)
+MidiHandler midiHandler;
 
 PShader feedbackShader;
 PGraphics[] buffers = new PGraphics[2];
@@ -185,8 +179,9 @@ void setup() {
   loadImageLibrary();
   if (imageFiles.size() > 0) loadImageByIndex(0);
 
-  // Initialise MIDI via javax.sound.midi
-  initMidi();
+  // Initialise MIDI via MidiHandler
+  midiHandler = new MidiHandler(this, 6);
+  midiHandler.init();
 
   println("Feedback Shader Test - Pi 3 Optimised");
   println("--------------------------------------");
@@ -718,109 +713,6 @@ void applyPreset(String name) {
     col_contrast = 1.2;
     post_noise = 0.03;
     post_blur = 0.2;
-  }
-}
-
-
-// ============================================================================
-// MIDI SETUP AND HANDLERS (pure Java javax.sound.midi)
-// ============================================================================
-
-void initMidi() {
-  try {
-    midiInfos = MidiSystem.getMidiDeviceInfo();
-    println("Available MIDI devices:");
-    for (int i = 0; i < midiInfos.length; i++) {
-      println("  [" + i + "] " + midiInfos[i].getName() + " - " + midiInfos[i].getDescription());
-    }
-
-    // Close any previously-open device
-    if (midiInputDevice != null) {
-      try { midiInputDevice.close(); } catch (Exception e) { /* ignore */ }
-      midiInputDevice = null;
-      midiTransmitter = null;
-      midiReceiver = null;
-    }
-
-    MidiDevice deviceToUse = null;
-    int chosenIndex = midiDeviceIndex;
-
-    // If user has specified an explicit index, try that first
-    if (chosenIndex >= 0 && chosenIndex < midiInfos.length) {
-      MidiDevice candidate = MidiSystem.getMidiDevice(midiInfos[chosenIndex]);
-      if (candidate.getMaxTransmitters() != 0) {
-        deviceToUse = candidate;
-      } else {
-        println("Requested MIDI device index " + chosenIndex + " has no transmitters; falling back to auto-select.");
-      }
-    }
-
-    // Auto-select: first device with a transmitter
-    if (deviceToUse == null) {
-      for (int i = 0; i < midiInfos.length; i++) {
-        MidiDevice candidate = MidiSystem.getMidiDevice(midiInfos[i]);
-        if (candidate.getMaxTransmitters() != 0) {
-          deviceToUse = candidate;
-          chosenIndex = i;
-          break;
-        }
-      }
-    }
-
-    // Open the chosen device
-    if (deviceToUse != null) {
-      try {
-        if (!deviceToUse.isOpen()) {
-          deviceToUse.open();
-        }
-        midiInputDevice = deviceToUse;
-        midiTransmitter = deviceToUse.getTransmitter();
-        midiReceiver = new MidiInputReceiver();
-        midiTransmitter.setReceiver(midiReceiver);
-        midiDeviceIndex = chosenIndex;
-        println("MIDI input connected to: [" + chosenIndex + "] " + midiInfos[chosenIndex].getName());
-      } catch (MidiUnavailableException e) {
-        println("Failed to open MIDI device [" + chosenIndex + "]: " + e.getMessage());
-        deviceToUse = null;
-      } catch (Exception e) {
-        println("MIDI setup error: " + e.getMessage());
-        deviceToUse = null;
-      }
-    }
-
-    if (midiInputDevice == null) {
-      println("No suitable MIDI input device found.");
-    }
-  } catch (Exception e) {
-    println("Error initialising MIDI: " + e.getMessage());
-    e.printStackTrace();
-  }
-}
-
-
-// Receiver that maps incoming MIDI messages to parameter changes.
-// Called from MIDI thread - writes directly to volatile float fields.
-// Float writes are atomic on ARM, so individual parameter reads in draw()
-// will always see a complete value (no torn reads).
-class MidiInputReceiver implements Receiver {
-  public void send(MidiMessage message, long timeStamp) {
-    if (message instanceof ShortMessage) {
-      ShortMessage sm = (ShortMessage) message;
-      int command = sm.getCommand();
-      int data1 = sm.getData1();
-      int data2 = sm.getData2();
-
-      if (command == ShortMessage.CONTROL_CHANGE) {
-        float norm = data2 / 127.0;
-        handleControllerChange(data1, norm);
-      } else if (command == ShortMessage.NOTE_ON && data2 > 0) {
-        gen_trigger = data2 / 127.0;
-      }
-    }
-  }
-
-  public void close() {
-    // Outer sketch handles device close
   }
 }
 
