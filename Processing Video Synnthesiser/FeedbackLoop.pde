@@ -214,11 +214,6 @@ void draw() {
   currentBuffer = 1 - currentBuffer;
 
   // --- TIMING DIAGNOSTIC (remove after profiling) ---
-  if (frameCount == 2) {
-    PGraphicsOpenGL pgl = (PGraphicsOpenGL) g;
-    println("GL Renderer: " + pgl.renderer.getString(PGL.RENDERER));
-    println("GL Version:  " + pgl.renderer.getString(PGL.VERSION));
-  }
   long t0 = System.currentTimeMillis();
 
   // Update shader uniforms
@@ -232,17 +227,18 @@ void draw() {
   buffers[currentBuffer].endDraw();
   long t2 = System.currentTimeMillis();
 
-  // Update delay buffer every 8 frames
+  // Update delay buffer every 8 frames, but only when it is actually in use
   frameCounter++;
-  if (frameCounter % 8 == 0) {
+  if (frameCounter % 8 == 0 && fb_delay_amount > 0.01) {
     delayBuffer.beginDraw();
     delayBuffer.image(buffers[currentBuffer], 0, 0);
     delayBuffer.endDraw();
   }
+  long t3 = System.currentTimeMillis();
 
   // Upscale to window size for display
   image(buffers[currentBuffer], 0, 0, width, height);
-  long t3 = System.currentTimeMillis();
+  long t4b = System.currentTimeMillis();
 
   // Reset trigger (decay flash)
   gen_trigger *= 0.9;
@@ -255,7 +251,7 @@ void draw() {
 
   // --- TIMING DIAGNOSTIC (remove after profiling) ---
   if (frameCount % 30 == 0) {
-    println("uniforms=" + (t1-t0) + "ms  shader=" + (t2-t1) + "ms  blit=" + (t3-t2) + "ms  hud=" + (t4-t3) + "ms  total=" + (t4-t0) + "ms  fps=" + nf(frameRate,0,1));
+    println("uniforms=" + (t1-t0) + "ms  shader=" + (t2-t1) + "ms  delay=" + (t3-t2) + "ms  blit=" + (t4b-t3) + "ms  hud=" + (t4-t4b) + "ms  total=" + (t4-t0) + "ms  fps=" + nf(frameRate,0,1));
   }
 }
 
