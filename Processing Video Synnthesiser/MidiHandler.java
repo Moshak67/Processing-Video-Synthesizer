@@ -18,9 +18,9 @@ public class MidiHandler {
   public void init() {
     try {
       midiInfos = MidiSystem.getMidiDeviceInfo();
-      parent.println("Available MIDI devices:");
+      System.out.println("Available MIDI devices:");
       for (int i = 0; i < midiInfos.length; i++) {
-        parent.println("  [" + i + "] " + midiInfos[i].getName() + " - " + midiInfos[i].getDescription());
+        System.out.println("  [" + i + "] " + midiInfos[i].getName() + " - " + midiInfos[i].getDescription());
       }
 
       if (midiInputDevice != null) {
@@ -38,7 +38,7 @@ public class MidiHandler {
         if (candidate.getMaxTransmitters() != 0) {
           deviceToUse = candidate;
         } else {
-          parent.println("Requested MIDI device index " + chosenIndex + " has no transmitters; falling back to auto-select.");
+          System.out.println("Requested MIDI device index " + chosenIndex + " has no transmitters; falling back to auto-select.");
         }
       }
 
@@ -63,19 +63,19 @@ public class MidiHandler {
           midiReceiver = new MidiInputReceiver();
           midiTransmitter.setReceiver(midiReceiver);
           midiDeviceIndex = chosenIndex;
-          parent.println("MIDI input connected to: [" + chosenIndex + "] " + midiInfos[chosenIndex].getName());
+          System.out.println("MIDI input connected to: [" + chosenIndex + "] " + midiInfos[chosenIndex].getName());
         } catch (MidiUnavailableException e) {
-          parent.println("Failed to open MIDI device [" + chosenIndex + "]: " + e.getMessage());
+          System.out.println("Failed to open MIDI device [" + chosenIndex + "]: " + e.getMessage());
         } catch (Exception e) {
-          parent.println("MIDI setup error: " + e.getMessage());
+          System.out.println("MIDI setup error: " + e.getMessage());
         }
       }
 
       if (midiInputDevice == null) {
-        parent.println("No suitable MIDI input device found.");
+        System.out.println("No suitable MIDI input device found.");
       }
     } catch (Exception e) {
-      parent.println("Error initialising MIDI: " + e.getMessage());
+      System.out.println("Error initialising MIDI: " + e.getMessage());
       e.printStackTrace();
     }
   }
