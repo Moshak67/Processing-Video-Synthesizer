@@ -470,28 +470,18 @@ vec3 posterize(vec3 col) {
 }
 
 vec3 solarize(vec3 col) {
-    float doS = step(0.01, u_fx_solarize);
-    float thresh = u_fx_solarize;
+    if (u_fx_solarize < 0.01) return col;
 
-    // Mode masks
-    float m0 = step(u_fx_solarize_mode, 0.5);                                    // classic
-    float m1 = step(0.5, u_fx_solarize_mode) * step(u_fx_solarize_mode, 1.5);   // symmetric
-    float m2 = step(1.5, u_fx_solarize_mode);                                    // multi
+    if (u_fx_solarize_mode < 0.5) {
+        vec3 mask = smoothstep(u_fx_solarize - u_fx_solarize_soft * 0.2,
+                               u_fx_solarize + u_fx_solarize_soft * 0.2, col);
+        return mix(col, 1.0 - col, mask);
+    }
+    if (u_fx_solarize_mode < 1.5)
+        return 1.0 - abs(col * 2.0 - 1.0);
 
-    // Classic: invert above threshold
-    vec3 mask = smoothstep(thresh - u_fx_solarize_soft * 0.2,
-                           thresh + u_fx_solarize_soft * 0.2, col);
-    vec3 s0 = mix(col, 1.0 - col, mask);
-
-    // Symmetric V-shape
-    vec3 s1 = 1.0 - abs(col * 2.0 - 1.0);
-
-    // Multi-fold
     vec3 folded = abs(abs(col * 4.0 - 2.0) - 1.0);
-    vec3 s2 = mix(col, folded, 0.5 + u_fx_solarize_soft * 0.5);
-
-    vec3 solarized = s0 * m0 + s1 * m1 + s2 * m2;
-    return mix(col, solarized, doS);
+    return mix(col, folded, 0.5 + u_fx_solarize_soft * 0.5);
 }
 
 vec3 thresholdEffect(vec3 col) {
@@ -502,13 +492,14 @@ vec3 thresholdEffect(vec3 col) {
 }
 
 vec2 pixelateUV(vec2 uv) {
-    float doP = step(1.5, u_fx_pixelate);
+    if (u_fx_pixelate < 1.5) return uv;
     vec2 pixelSize = vec2(u_fx_pixelate) / u_resolution;
-    vec2 pixelated = floor(uv / pixelSize) * pixelSize + pixelSize * 0.5;
-    return mix(uv, pixelated, doP);
+    return floor(uv / pixelSize) * pixelSize + pixelSize * 0.5;
 }
 
 vec3 applyEffects(vec3 col) {
+    if (u_fx_posterize < 2.0 && u_fx_solarize < 0.01 && u_fx_threshold < 0.01)
+        return col;
     col = posterize(col);
     col = solarize(col);
     col = thresholdEffect(col);
