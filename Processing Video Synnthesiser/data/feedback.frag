@@ -30,7 +30,7 @@ uniform vec2 u_resolution;         // Output resolution
 // GENERATOR PARAMETERS (CC 1-9)
 // All mode/type uniforms are float for branchless step() on VideoCore IV
 // -----------------------------------------------------------------------------
-uniform float u_gen_type;           // 0=off, 1=voronoi, 2=domain-warped, 3=outlined-shapes, 4=stripes, 5=reaction-diffusion, 6=moire
+uniform float u_gen_type;           // 0=off, 1=voronoi, 2=domain-warped, 3=outlined-shapes, 4=stripes, 5=moire, 6=image
 uniform float u_gen_frequency;     // Oscillator/animation frequency [0.1 - 20.0]
 uniform float u_gen_size;          // Size/radius/scale [0.0 - 1.0]
 uniform float u_gen_pos_x;         // X position [-1.0 - 1.0]
@@ -313,31 +313,7 @@ vec3 generateSource(vec2 uv, vec2 fb_uv) {
         col = genColour * v;
 
     } else if (u_gen_type < 5.5) {
-        // 5: Reaction-Diffusion Seed
-        vec3 centre = texture2D(u_feedback, uv).rgb;
-        float c = luminance(centre);
-        float n1 = luminance(texture2D(u_feedback, uv + vec2(px.x, 0.0)).rgb);
-        float n2 = luminance(texture2D(u_feedback, uv - vec2(px.x, 0.0)).rgb);
-        float n3 = luminance(texture2D(u_feedback, uv + vec2(0.0, px.y)).rgb);
-        float n4 = luminance(texture2D(u_feedback, uv - vec2(0.0, px.y)).rgb);
-        float d1 = luminance(texture2D(u_feedback, uv + vec2(px.x, px.y)).rgb);
-        float d2 = luminance(texture2D(u_feedback, uv - vec2(px.x, px.y)).rgb);
-        float d3 = luminance(texture2D(u_feedback, uv + vec2(px.x, -px.y)).rgb);
-        float d4 = luminance(texture2D(u_feedback, uv - vec2(px.x, -px.y)).rgb);
-        float neighbors = (n1 + n2 + n3 + n4) * 0.25;
-        float neighbors_all = (n1 + n2 + n3 + n4 + d1 + d2 + d3 + d4) * 0.125;
-        float noise = fbm(uv * (5.0 + u_gen_size * 15.0) + t * u_gen_frequency * 0.2);
-        float excitation = neighbors_all - c;
-        float growthZone = smoothstep(0.0, 0.2, neighbors) * smoothstep(0.8, 0.6, neighbors);
-        float diffused = mix(c, neighbors_all, u_gen_softness);
-        float seed = noise * (1.0 - smoothstep(0.0, 0.3, c));
-        float reaction = growthZone * 0.3 + excitation * u_gen_softness * 0.2;
-        float decay = c * u_gen_frequency * 0.02;
-        v = clamp(diffused + reaction + seed * 0.5 - decay, 0.0, 1.0);
-        col = genColour * v;
-
-    } else if (u_gen_type < 6.5) {
-        // 6: Moire
+        // 5: Moire
         float scale1 = 20.0 + u_gen_size * 40.0;
         float scale2 = scale1 * 1.1;
         float p1 = sin(centered.x * scale1 + t) * sin(centered.y * scale1);
@@ -347,7 +323,7 @@ vec3 generateSource(vec2 uv, vec2 fb_uv) {
         col = genColour * v;
 
     } else {
-        // 7: Image sampler
+        // 6: Image sampler
         float imgZoom = max(u_gen_size * 2.0, 0.01);
         vec2 imgUV = clamp(centered / imgZoom + 0.5, 0.0, 1.0);
         vec3 imgRaw = texture2D(u_gen_image, imgUV).rgb;

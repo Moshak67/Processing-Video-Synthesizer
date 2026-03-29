@@ -3,17 +3,17 @@
 // ============================================================================
 // Processing sketch for testing the analog video feedback shader.
 // Optimised for Raspberry Pi 3 deployment.
-// Includes keyboard controls and MIDI input via javax.sound.midi.
 //
-// Pi 3 optimisations:
-//   - Render buffers at 640x360 (upscaled to window size for display)
-//   - Target frame rate capped at 30fps
-//   - HUD drawn every 15 frames to reduce GL state changes
-//   - All mode uniforms sent as float (matches branchless shader)
+// Pi 3 optimisations (v2 — raw GL texture ping-pong):
+//   - Single GL context: raw GL textures + FBO instead of 3× P2D PGraphics
+//   - Delay buffer updated by pointer swap (no pixel copy / glFinish stall)
+//   - HUD pre-rendered to JAVA2D PGraphics, redrawn only when hudDirty=true
+//   - Render resolution reduced to 256×144 (~32ms GPU, fits 30fps budget)
+//   - Reaction-diffusion generator removed (was 9× texture samples per pixel)
 //
 // Controls (no conflicts - lowercase=primary, SHIFT=secondary):
 //   --- Generator ---
-//   1-6            : Generator types (voronoi, domain-warped, outlined-shapes, stripes, reaction-diff, moire)
+//   1-6            : Generator types (voronoi, domain-warped, outlined-shapes, stripes, moire, image)
 //   z/x            : Generator frequency -/+
 //   c/v            : Generator size -/+
 //   b/n            : Generator pos X -/+
@@ -72,38 +72,50 @@
 //   TAB            : Toggle HUD display
 // ============================================================================
 
+import processing.opengl.*;
+import java.nio.IntBuffer;
+
 // MIDI handled via MidiHandler.java (pure Java, bypasses Processing preprocessor)
 MidiHandler midiHandler;
 
 PShader feedbackShader;
-PGraphics[] buffers = new PGraphics[2];
-int currentBuffer = 0;
-PGraphics delayBuffer; // Long-delay feedback buffer
-int frameCounter = 0;  // For delay buffer update timing
+PShader blitShader;
+
+// Raw GL resources (initialised in first draw() call)
+int[] texIds  = new int[3];  // [0]=bufA, [1]=bufB, [2]=delay
+int   fboId   = -1;
+boolean glReady = false;
+int currentTex = 0;          // index into texIds for current write target
+
+// Source image raw GL texture ID (0 = not yet extracted)
+int sourceImgTexId = 0;
+
+// HUD cache
+PGraphics hudCache;
+boolean hudDirty = true;
 
 // Render resolution (independent of window size for Pi 3 performance)
-final int RENDER_W = 320;
-final int RENDER_H = 180;
+final int RENDER_W = 256;
+final int RENDER_H = 144;
 
 // HUD control
 boolean showHUD = true;
-final int HUD_INTERVAL = 15; // only redraw HUD every N frames
 
 // Fullscreen toggle
 boolean isFullScreen = false;
 final int WINDOW_W = 1280;
 final int WINDOW_H = 720;
 
+int frameCounter = 0;
 
-// MIDI thread safety: incoming MIDI writes to these volatile pending values,
-// draw() copies them to the active params at the start of each frame.
+// MIDI thread safety
 volatile boolean midiDirty = false;
 
 ArrayList<String> imageFiles = new ArrayList<String>();
 int currentImageIndex = 0;
-PImage sourceImage;       // Currently loaded image (resized to RENDER_W x RENDER_H)
+PImage sourceImage;  // Currently loaded image (resized to RENDER_W × RENDER_H)
 
-// Parameters with defaults - all floats (including modes) for branchless shader
+// Parameters with defaults
 float gen_type = 1;
 float gen_frequency = 1.0;
 float gen_size = 0.3;
@@ -163,208 +175,236 @@ void settings() {
 }
 
 void setup() {
-
   // Set high so JOGL's animator doesn't sleep between frames.
-  // On Pi 3, Thread.sleep() has ~100ms resolution; any sleep target causes ~10fps.
-  // With frameRate(120), calculated sleep is negative → no sleep → vsync throttles.
   frameRate(120);
 
-  // Load shader
   feedbackShader = loadShader("feedback.frag", "passthrough.vert");
+  blitShader     = loadShader("blit.frag",     "passthrough.vert");
 
-  // Create ping-pong buffers at reduced render resolution
-  buffers[0] = createGraphics(RENDER_W, RENDER_H, P2D);
-  buffers[0].noSmooth();
-  buffers[1] = createGraphics(RENDER_W, RENDER_H, P2D);
-  buffers[1].noSmooth();
-  delayBuffer = createGraphics(RENDER_W, RENDER_H, P2D);
-  delayBuffer.noSmooth();
-
-  // Clear buffers
-  clearBuffers();
-
-  // Load image library for generator type 7
+  // Image library for generator type 6
   loadImageLibrary();
   if (imageFiles.size() > 0) loadImageByIndex(0);
 
-  // Initialise MIDI via MidiHandler
+  // Initialise MIDI
   midiHandler = new MidiHandler(this, 3);
   midiHandler.init();
 
-  println("Feedback Shader Test - Pi 3 Optimised");
-  println("--------------------------------------");
-  println("Render: " + RENDER_W + "x" + RENDER_H + " @ 30fps (upscaled to " + width + "x" + height + ")");
-  println("--------------------------------------");
-  println("1-6: Gen type | q/a: Feedback | w/s: Decay");
-  println("e/d: Scale | r/f: Rotation | t/g: Hue shift");
-  println("y/h: Edge type | u/j: Edge mix | 7/8: Edge threshold");
-  println("i/k: Posterize | o/l: Solarize | m: Mirror");
-  println("z/x: Gen freq | c/v: Gen size | b/n: Gen X");
-  println(",/.: Gen Y | ;/': Gen softness | [/]: Gen hue");
-  println("+/-: Gen intensity | SPACE: Trigger | BACKSPACE: Clear");
-  println("SHIFT+S/D: Sat | SHIFT+F/G: Bright | SHIFT+H/J: Contrast");
-  println("SHIFT+K/L: RGB sep | SHIFT+B: Blend | SHIFT+N: Blur");
-  println("SHIFT+M: Noise | <: Soft clip | >: Sharpen");
-  println("0: Reset | TAB: Toggle HUD");
-  println("!: Tunnel | @: Psychedelic | #: Glitch | $: Minimal | %: Kaleidoscope | ^: VHS");
+  println("Feedback Shader — Pi 3 Optimised (v2 raw GL)");
+  println("Render: " + RENDER_W + "x" + RENDER_H + " @ 30fps → " + width + "x" + height);
+  println("1-6: Gen | q/a: FB | w/s: Decay | e/d: Scale | r/f: Rot");
+  println("0: Reset | TAB: HUD | BACKSPACE: Clear | !-^: Presets");
 }
 
 
-long _prevDrawEnd = 0;
+// ============================================================================
+// GL RESOURCE INITIALISATION (called once from first draw())
+// ============================================================================
+
+void initGL() {
+  PGL pgl = beginPGL();
+
+  // Generate 3 textures: bufA, bufB, delay
+  IntBuffer tb = IntBuffer.allocate(3);
+  pgl.genTextures(3, tb);
+  texIds[0] = tb.get(0);
+  texIds[1] = tb.get(1);
+  texIds[2] = tb.get(2);
+
+  for (int id : texIds) {
+    pgl.bindTexture(PGL.TEXTURE_2D, id);
+    pgl.texImage2D(PGL.TEXTURE_2D, 0, PGL.RGBA, RENDER_W, RENDER_H,
+                   0, PGL.RGBA, PGL.UNSIGNED_BYTE, null);
+    pgl.texParameteri(PGL.TEXTURE_2D, PGL.TEXTURE_MIN_FILTER, PGL.LINEAR);
+    pgl.texParameteri(PGL.TEXTURE_2D, PGL.TEXTURE_MAG_FILTER, PGL.LINEAR);
+    pgl.texParameteri(PGL.TEXTURE_2D, PGL.TEXTURE_WRAP_S, PGL.REPEAT);
+    pgl.texParameteri(PGL.TEXTURE_2D, PGL.TEXTURE_WRAP_T, PGL.REPEAT);
+  }
+  pgl.bindTexture(PGL.TEXTURE_2D, 0);
+
+  // Generate FBO
+  IntBuffer fb = IntBuffer.allocate(1);
+  pgl.genFramebuffers(1, fb);
+  fboId = fb.get(0);
+
+  endPGL();
+
+  // HUD cache uses JAVA2D — no GL context, CPU-only image
+  hudCache  = createGraphics(290, 180, JAVA2D);
+  hudDirty  = true;
+  glReady   = true;
+}
+
+
+// ============================================================================
+// DRAW
+// ============================================================================
 
 void draw() {
-  // Swap buffers
-  int prev = currentBuffer;
-  currentBuffer = 1 - currentBuffer;
+  if (!glReady) { initGL(); return; }
 
-  // --- TIMING DIAGNOSTIC (remove after profiling) ---
-  long t0 = System.currentTimeMillis();
-  long gap = (_prevDrawEnd > 0) ? (t0 - _prevDrawEnd) : 0;
+  int prevTex = 1 - currentTex;
 
-  // Update shader uniforms
-  updateShaderUniforms(prev);
-  long t1 = System.currentTimeMillis();
+  // --- 1. Bind our FBO, attach currentTex as render target ---
+  PGL pgl = beginPGL();
+  pgl.bindFramebuffer(PGL.FRAMEBUFFER, fboId);
+  pgl.framebufferTexture2D(PGL.FRAMEBUFFER, PGL.COLOR_ATTACHMENT0,
+                            PGL.TEXTURE_2D, texIds[currentTex], 0);
+  pgl.viewport(0, 0, RENDER_W, RENDER_H);
 
-  // Render to current buffer at reduced resolution
-  buffers[currentBuffer].beginDraw();
-  buffers[currentBuffer].shader(feedbackShader);
-  buffers[currentBuffer].rect(0, 0, RENDER_W, RENDER_H);
-  buffers[currentBuffer].endDraw();
-  long t2 = System.currentTimeMillis();
+  // Bind prev frame → unit 0 (u_feedback)
+  pgl.activeTexture(PGL.TEXTURE0);
+  pgl.bindTexture(PGL.TEXTURE_2D, texIds[prevTex]);
 
-  // Update delay buffer every 8 frames, but only when it is actually in use
-  frameCounter++;
-  if (frameCounter % 8 == 0 && fb_delay_amount > 0.01) {
-    delayBuffer.beginDraw();
-    delayBuffer.image(buffers[currentBuffer], 0, 0);
-    delayBuffer.endDraw();
+  // Bind delay → unit 1 (u_delay_feedback)
+  pgl.activeTexture(PGL.TEXTURE1);
+  pgl.bindTexture(PGL.TEXTURE_2D, texIds[2]);
+
+  // Bind source image → unit 2 (u_gen_image), extract raw ID lazily
+  if (sourceImage != null) {
+    if (sourceImgTexId == 0) {
+      Texture t = ((PGraphicsOpenGL)g).getTexture(sourceImage);
+      if (t != null) sourceImgTexId = t.glName;
+    }
+    if (sourceImgTexId != 0) {
+      pgl.activeTexture(PGL.TEXTURE2);
+      pgl.bindTexture(PGL.TEXTURE_2D, sourceImgTexId);
+    }
   }
-  long t3 = System.currentTimeMillis();
 
-  // Upscale to window size for display
-  image(buffers[currentBuffer], 0, 0, width, height);
-  long t4b = System.currentTimeMillis();
+  pgl.activeTexture(PGL.TEXTURE0);  // leave active unit at 0
+  endPGL();
 
-  // Reset trigger (decay flash)
-  gen_trigger *= 0.9;
+  // --- 2. Set shader uniforms (textures as unit indices, not PImage/PGraphics) ---
+  feedbackShader.set("u_feedback",       0);
+  feedbackShader.set("u_delay_feedback", 1);
+  feedbackShader.set("u_gen_image",      2);
 
-  // Display HUD (toggle with TAB)
-  if (showHUD) {
-    displayParameters();
-  }
-  long t4 = System.currentTimeMillis();
+  feedbackShader.set("u_time",       millis() / 1000.0);
+  feedbackShader.set("u_resolution", (float)RENDER_W, (float)RENDER_H);
 
-  // --- TIMING DIAGNOSTIC (remove after profiling) ---
-  _prevDrawEnd = System.currentTimeMillis();
-  if (frameCount % 30 == 0) {
-    println("gap=" + gap + "ms  uniforms=" + (t1-t0) + "ms  shader=" + (t2-t1) + "ms  delay=" + (t3-t2) + "ms  blit=" + (t4b-t3) + "ms  hud=" + (t4-t4b) + "ms  total=" + (t4-t0) + "ms  fps=" + nf(frameRate,0,1));
-  }
-}
-
-
-void updateShaderUniforms(int prevBuffer) {
-  feedbackShader.set("u_feedback", buffers[prevBuffer]);
-  feedbackShader.set("u_time", millis() / 1000.0);
-  // Use actual pixel dimensions (accounts for Retina/HiDPI scaling)
-  // On a 2x display, a 640x360 PGraphics has pixelWidth=1280, pixelHeight=720
-  // gl_FragCoord uses real pixels, so u_resolution must match
-  feedbackShader.set("u_resolution", (float)buffers[prevBuffer].pixelWidth, (float)buffers[prevBuffer].pixelHeight);
-
-  // Generator - all sent as float for branchless shader
-  feedbackShader.set("u_gen_type", gen_type);
+  feedbackShader.set("u_gen_type",      gen_type);
   feedbackShader.set("u_gen_frequency", gen_frequency);
-  feedbackShader.set("u_gen_size", gen_size);
-  feedbackShader.set("u_gen_pos_x", gen_pos_x);
-  feedbackShader.set("u_gen_pos_y", gen_pos_y);
-  feedbackShader.set("u_gen_softness", gen_softness);
-  feedbackShader.set("u_gen_hue", gen_hue);
+  feedbackShader.set("u_gen_size",      gen_size);
+  feedbackShader.set("u_gen_pos_x",     gen_pos_x);
+  feedbackShader.set("u_gen_pos_y",     gen_pos_y);
+  feedbackShader.set("u_gen_softness",  gen_softness);
+  feedbackShader.set("u_gen_hue",       gen_hue);
   feedbackShader.set("u_gen_intensity", gen_intensity);
-  feedbackShader.set("u_gen_trigger", gen_trigger);
+  feedbackShader.set("u_gen_trigger",   gen_trigger);
 
-  // Feedback
-  feedbackShader.set("u_fb_amount", fb_amount);
-  feedbackShader.set("u_fb_decay", fb_decay);
+  feedbackShader.set("u_fb_amount",      fb_amount);
+  feedbackShader.set("u_fb_decay",       fb_decay);
   feedbackShader.set("u_fb_tap2_amount", fb_tap2_amount);
   feedbackShader.set("u_fb_tap2_offset", fb_tap2_offset);
-  feedbackShader.set("u_delay_feedback", delayBuffer);
   feedbackShader.set("u_fb_delay_amount", fb_delay_amount);
 
-  // Image generator (Type 7)
-  if (sourceImage != null) {
-    feedbackShader.set("u_gen_image", sourceImage);
-  }
-
-  // Transform
-  feedbackShader.set("u_tf_scale", tf_scale);
-  feedbackShader.set("u_tf_rotation", tf_rotation);
+  feedbackShader.set("u_tf_scale",       tf_scale);
+  feedbackShader.set("u_tf_rotation",    tf_rotation);
   feedbackShader.set("u_tf_translate_x", tf_translate_x);
   feedbackShader.set("u_tf_translate_y", tf_translate_y);
-  feedbackShader.set("u_tf_mirror", tf_mirror);
-  feedbackShader.set("u_tf_displace", tf_displace);
+  feedbackShader.set("u_tf_mirror",      tf_mirror);
+  feedbackShader.set("u_tf_displace",    tf_displace);
 
-  // Edge detection
-  feedbackShader.set("u_edge_type", edge_type);
-  feedbackShader.set("u_edge_mix", edge_mix);
-  feedbackShader.set("u_edge_threshold", edge_threshold);
-  feedbackShader.set("u_edge_colour_mode", edge_colour_mode);
-  feedbackShader.set("u_edge_pre_fb", edge_pre_fb);
+  feedbackShader.set("u_edge_type",         edge_type);
+  feedbackShader.set("u_edge_mix",          edge_mix);
+  feedbackShader.set("u_edge_threshold",    edge_threshold);
+  feedbackShader.set("u_edge_colour_mode",  edge_colour_mode);
+  feedbackShader.set("u_edge_pre_fb",       edge_pre_fb);
 
-  // Effects
-  feedbackShader.set("u_fx_posterize", fx_posterize);
+  feedbackShader.set("u_fx_posterize",        fx_posterize);
   feedbackShader.set("u_fx_posterize_smooth", fx_posterize_smooth);
-  feedbackShader.set("u_fx_solarize", fx_solarize);
-  feedbackShader.set("u_fx_solarize_soft", fx_solarize_soft);
-  feedbackShader.set("u_fx_solarize_mode", fx_solarize_mode);
-  feedbackShader.set("u_fx_threshold", fx_threshold);
-  feedbackShader.set("u_fx_pixelate", fx_pixelate);
-  feedbackShader.set("u_fx_pre_fb", fx_pre_fb);
+  feedbackShader.set("u_fx_solarize",         fx_solarize);
+  feedbackShader.set("u_fx_solarize_soft",    fx_solarize_soft);
+  feedbackShader.set("u_fx_solarize_mode",    fx_solarize_mode);
+  feedbackShader.set("u_fx_threshold",        fx_threshold);
+  feedbackShader.set("u_fx_pixelate",         fx_pixelate);
+  feedbackShader.set("u_fx_pre_fb",           fx_pre_fb);
 
-  // Colour
-  feedbackShader.set("u_col_hue_shift", col_hue_shift);
+  feedbackShader.set("u_col_hue_shift",  col_hue_shift);
   feedbackShader.set("u_col_saturation", col_saturation);
   feedbackShader.set("u_col_brightness", col_brightness);
-  feedbackShader.set("u_col_contrast", col_contrast);
-  feedbackShader.set("u_col_rgb_sep", col_rgb_sep);
-  feedbackShader.set("u_col_invert", col_invert);
+  feedbackShader.set("u_col_contrast",   col_contrast);
+  feedbackShader.set("u_col_rgb_sep",    col_rgb_sep);
+  feedbackShader.set("u_col_invert",     col_invert);
 
-  // Blend
-  feedbackShader.set("u_blend_mode", blend_mode);
-
-  // Post
-  feedbackShader.set("u_post_blur", post_blur);
-  feedbackShader.set("u_post_noise", post_noise);
+  feedbackShader.set("u_blend_mode",    blend_mode);
+  feedbackShader.set("u_post_blur",     post_blur);
+  feedbackShader.set("u_post_noise",    post_noise);
   feedbackShader.set("u_post_soft_clip", post_soft_clip);
-  feedbackShader.set("u_post_sharpen", post_sharpen);
+  feedbackShader.set("u_post_sharpen",  post_sharpen);
+
+  // --- 3. Draw fullscreen quad into FBO ---
+  // Viewport is RENDER_W×RENDER_H; rect covers full projection space → clips to FBO.
+  shader(feedbackShader);
+  rect(0, 0, width, height);
+  resetShader();
+
+  // --- 4. Unbind FBO → render back to screen ---
+  pgl = beginPGL();
+  pgl.bindFramebuffer(PGL.FRAMEBUFFER, 0);
+  pgl.viewport(0, 0, width, height);
+  pgl.activeTexture(PGL.TEXTURE0);
+  pgl.bindTexture(PGL.TEXTURE_2D, texIds[currentTex]);
+  endPGL();
+
+  blitShader.set("u_tex",        0);
+  blitShader.set("u_screen_res", (float)width, (float)height);
+  shader(blitShader);
+  rect(0, 0, width, height);
+  resetShader();
+
+  // --- 5. Swap ping-pong ---
+  currentTex = 1 - currentTex;
+
+  // --- 6. Update delay texture (pointer swap only — no pixel copy) ---
+  frameCounter++;
+  if (frameCounter % 8 == 0 && fb_delay_amount > 0.01) {
+    int tmp = texIds[2]; texIds[2] = texIds[prevTex]; texIds[prevTex] = tmp;
+  }
+
+  // --- 7. HUD ---
+  if (showHUD) {
+    if (hudDirty) { renderHUDToCache(); hudDirty = false; }
+    image(hudCache, 10, 10);
+  }
+
+  gen_trigger *= 0.9;
 }
 
 
-void displayParameters() {
-  fill(0, 0, 0, 180);
-  noStroke();
-  rect(10, 10, 280, 170);
+// ============================================================================
+// HUD CACHE
+// ============================================================================
 
-  fill(255);
-  textSize(11);
-  int y = 25;
-  int lineHeight = 14;
+void renderHUDToCache() {
+  String[] genTypes   = {"Off","Voronoi","DomainWarp","Outlines","Stripes","Moire","Image"};
+  String[] edgeTypes  = {"Off","Roberts","Gradient","Sobel","Temporal"};
+  String[] blendTypes = {"Mix","Add","Multiply","Screen","Diff","Overlay"};
 
-  String[] genTypes = {"Off", "Voronoi", "DomainWarp", "Outlines", "Stripes", "ReactionDiff", "Moire", "Image"};
-  String[] edgeTypes = {"Off", "Roberts", "Gradient", "Sobel", "Temporal"};
-  String[] blendTypes = {"Mix", "Add", "Multiply", "Screen", "Diff", "Overlay"};
+  hudCache.beginDraw();
+  hudCache.background(0, 0, 0, 180);
+  hudCache.fill(255);
+  hudCache.noStroke();
+  hudCache.textSize(11);
+  int y = 15;
+  int lh = 14;
 
-  text("Gen: " + genTypes[(int)gen_type] + " | Int: " + nf(gen_intensity, 1, 2) + " | Freq: " + nf(gen_frequency, 1, 1), 15, y); y += lineHeight;
-  text("Feedback: " + nf(fb_amount, 1, 2) + " | Decay: " + nf(fb_decay, 1, 2), 15, y); y += lineHeight;
-  text("Tap2: " + nf(fb_tap2_amount, 1, 2) + " | Delay: " + nf(fb_delay_amount, 1, 2) + " | Displace: " + nf(tf_displace, 1, 3), 15, y); y += lineHeight;
-  text("Scale: " + nf(tf_scale, 1, 3) + " | Rot: " + nf(tf_rotation, 1, 3) + " | Mirror: " + (int)tf_mirror, 15, y); y += lineHeight;
-  text("Edge: " + edgeTypes[(int)edge_type] + " | Mix: " + nf(edge_mix, 1, 2) + " | Thr: " + nf(edge_threshold, 1, 2), 15, y); y += lineHeight;
-  text("Posterize: " + (int)fx_posterize + " | Solarize: " + nf(fx_solarize, 1, 2), 15, y); y += lineHeight;
-  text("Hue: " + nf(col_hue_shift, 1, 3) + " | Sat: " + nf(col_saturation, 1, 2) + " | Blend: " + blendTypes[(int)blend_mode], 15, y); y += lineHeight;
-  text("Blur: " + nf(post_blur, 1, 2) + " | Sharp: " + nf(post_sharpen, 1, 2) + " | Noise: " + nf(post_noise, 1, 3), 15, y); y += lineHeight;
-  text("RGB sep: " + nf(col_rgb_sep, 1, 3) + " | Contrast: " + nf(col_contrast, 1, 2), 15, y); y += lineHeight;
-  text("Render: " + RENDER_W + "x" + RENDER_H + " | FPS: " + (int)frameRate, 15, y); y += lineHeight;
-  if ((int)gen_type == 7 && imageFiles.size() > 0) {
-    text("Img: [" + currentImageIndex + "] " + imageFiles.get(currentImageIndex), 15, y);
+  int gt = (int)gen_type;
+  String gtName = (gt >= 0 && gt < genTypes.length) ? genTypes[gt] : "?";
+  hudCache.text("Gen: " + gtName + " | Int: " + nf(gen_intensity,1,2) + " | Freq: " + nf(gen_frequency,1,1), 5, y); y += lh;
+  hudCache.text("Feedback: " + nf(fb_amount,1,2) + " | Decay: " + nf(fb_decay,1,2), 5, y); y += lh;
+  hudCache.text("Tap2: " + nf(fb_tap2_amount,1,2) + " | Delay: " + nf(fb_delay_amount,1,2) + " | Displace: " + nf(tf_displace,1,3), 5, y); y += lh;
+  hudCache.text("Scale: " + nf(tf_scale,1,3) + " | Rot: " + nf(tf_rotation,1,3) + " | Mirror: " + (int)tf_mirror, 5, y); y += lh;
+  hudCache.text("Edge: " + edgeTypes[(int)edge_type] + " | Mix: " + nf(edge_mix,1,2) + " | Thr: " + nf(edge_threshold,1,2), 5, y); y += lh;
+  hudCache.text("Posterize: " + (int)fx_posterize + " | Solarize: " + nf(fx_solarize,1,2), 5, y); y += lh;
+  hudCache.text("Hue: " + nf(col_hue_shift,1,3) + " | Sat: " + nf(col_saturation,1,2) + " | Blend: " + blendTypes[(int)blend_mode], 5, y); y += lh;
+  hudCache.text("Blur: " + nf(post_blur,1,2) + " | Sharp: " + nf(post_sharpen,1,2) + " | Noise: " + nf(post_noise,1,3), 5, y); y += lh;
+  hudCache.text("RGB sep: " + nf(col_rgb_sep,1,3) + " | Contrast: " + nf(col_contrast,1,2), 5, y); y += lh;
+  hudCache.text("Render: " + RENDER_W + "x" + RENDER_H + " | FPS: " + (int)frameRate, 5, y); y += lh;
+  if (gt == 6 && imageFiles.size() > 0) {
+    hudCache.text("Img: [" + currentImageIndex + "] " + imageFiles.get(currentImageIndex), 5, y);
   }
+  hudCache.endDraw();
 }
 
 
@@ -385,7 +425,7 @@ void toggleFullScreen() {
 
 
 // ============================================================================
-// IMAGE LIBRARY FUNCTIONS
+// IMAGE LIBRARY
 // ============================================================================
 
 void loadImageLibrary() {
@@ -409,16 +449,35 @@ void loadImageByIndex(int idx) {
   if (imageFiles.size() == 0) return;
   currentImageIndex = ((idx % imageFiles.size()) + imageFiles.size()) % imageFiles.size();
   String path = sketchPath("FB Images/" + imageFiles.get(currentImageIndex));
-  sourceImage = loadImage(path);
+  sourceImage    = loadImage(path);
   sourceImage.resize(RENDER_W, RENDER_H);
+  sourceImgTexId = 0;  // invalidate cached GL ID — re-extracted in draw()
   println("Image: [" + currentImageIndex + "] " + imageFiles.get(currentImageIndex));
 }
 
 
 // ============================================================================
+// CLEAR BUFFERS
+// ============================================================================
+
+void clearBuffers() {
+  if (!glReady) { frameCounter = 0; return; }
+  PGL pgl = beginPGL();
+  pgl.bindFramebuffer(PGL.FRAMEBUFFER, fboId);
+  pgl.clearColor(0, 0, 0, 1);
+  for (int i = 0; i < 3; i++) {
+    pgl.framebufferTexture2D(PGL.FRAMEBUFFER, PGL.COLOR_ATTACHMENT0,
+                              PGL.TEXTURE_2D, texIds[i], 0);
+    pgl.clear(PGL.COLOR_BUFFER_BIT);
+  }
+  pgl.bindFramebuffer(PGL.FRAMEBUFFER, 0);
+  endPGL();
+  frameCounter = 0;
+}
+
+
+// ============================================================================
 // KEYBOARD CONTROLS
-// Fixed: no key conflicts. Lowercase = primary group, SHIFT = secondary group.
-// Uses early return after each match to prevent fallthrough.
 // ============================================================================
 
 void keyPressed() {
@@ -426,249 +485,148 @@ void keyPressed() {
                     || key == '$' || key == '%' || key == '^' || key == '<' || key == '>'
                     || key == ':' || key == '"';
 
-  // --- Presets (Shift+1..6 -> ! @ # $ % ^) ---
-  if (key == '!') { applyPreset("tunnel"); return; }
-  if (key == '@') { applyPreset("psychedelic"); return; }
-  if (key == '#') { applyPreset("glitch"); return; }
-  if (key == '$') { applyPreset("minimal"); return; }
+  // Presets
+  if (key == '!') { applyPreset("tunnel");       return; }
+  if (key == '@') { applyPreset("psychedelic");  return; }
+  if (key == '#') { applyPreset("glitch");       return; }
+  if (key == '$') { applyPreset("minimal");      return; }
   if (key == '%') { applyPreset("kaleidoscope"); return; }
-  if (key == '^') { applyPreset("vhs"); return; }
+  if (key == '^') { applyPreset("vhs");          return; }
 
-  // --- Utility ---
-  if (key == '0') { resetParameters(); return; }
-  if (keyCode == BACKSPACE) { clearBuffers(); return; }
-  if (key == ' ') { gen_trigger = 1.0; return; }
-  if (key == TAB) { showHUD = !showHUD; return; }
-  if (key == '\\') { toggleFullScreen(); return; }
+  // Utility
+  if (key == '0')         { resetParameters(); return; }
+  if (keyCode == BACKSPACE) { clearBuffers();  return; }
+  if (key == ' ')         { gen_trigger = 1.0; return; }
+  if (key == TAB)         { showHUD = !showHUD; return; }
+  if (key == '\\')        { toggleFullScreen(); return; }
 
-  // --- Generator types (number keys, unshifted) ---
-  if (key == '1') { gen_type = 1; return; }
-  if (key == '2' && !shifted) { gen_type = 2; return; }
-  if (key == '3' && !shifted) { gen_type = 3; return; }
-  if (key == '4' && !shifted) { gen_type = 4; return; }
-  if (key == '5' && !shifted) { gen_type = 5; return; }
-  if (key == '6' && !shifted) { gen_type = 6; return; }
+  // Generator types (0-6)
+  if (key == '1') { gen_type = 1; hudDirty = true; return; }
+  if (key == '2' && !shifted) { gen_type = 2; hudDirty = true; return; }
+  if (key == '3' && !shifted) { gen_type = 3; hudDirty = true; return; }
+  if (key == '4' && !shifted) { gen_type = 4; hudDirty = true; return; }
+  if (key == '5' && !shifted) { gen_type = 5; hudDirty = true; return; }  // Moire
+  if (key == '6' && !shifted) { gen_type = 6; hudDirty = true; return; }  // Image
 
-  // --- Generator intensity ---
-  if (key == '+' || key == '=') { gen_intensity = constrain(gen_intensity + 0.05, 0, 1); return; }
-  if (key == '-' || key == '_') { gen_intensity = constrain(gen_intensity - 0.05, 0, 1); return; }
+  // Generator intensity
+  if (key == '+' || key == '=') { gen_intensity = constrain(gen_intensity + 0.05, 0, 1); hudDirty = true; return; }
+  if (key == '-' || key == '_') { gen_intensity = constrain(gen_intensity - 0.05, 0, 1); hudDirty = true; return; }
 
-  // --- Edge threshold ---
-  if (key == '7') { edge_threshold = constrain(edge_threshold + 0.02, 0.0, 1.0); return; }
-  if (key == '8') { edge_threshold = constrain(edge_threshold - 0.02, 0.0, 1.0); return; }
+  // Edge threshold
+  if (key == '7') { edge_threshold = constrain(edge_threshold + 0.02, 0.0, 1.0); hudDirty = true; return; }
+  if (key == '8') { edge_threshold = constrain(edge_threshold - 0.02, 0.0, 1.0); hudDirty = true; return; }
 
-  // --- Edge colour mode ---
-  if (key == '9') { edge_colour_mode = (edge_colour_mode + 1) % 3; return; }
+  // Edge colour mode
+  if (key == '9') { edge_colour_mode = (edge_colour_mode + 1) % 3; hudDirty = true; return; }
 
-  // --- Generator hue ---
-  if (key == '[') { gen_hue = (gen_hue - 0.02 + 1.0) % 1.0; return; }
-  if (key == ']') { gen_hue = (gen_hue + 0.02) % 1.0; return; }
+  // Generator hue
+  if (key == '[') { gen_hue = (gen_hue - 0.02 + 1.0) % 1.0; hudDirty = true; return; }
+  if (key == ']') { gen_hue = (gen_hue + 0.02) % 1.0; hudDirty = true; return; }
 
-  // --- Generator softness ---
-  if (key == ';') { gen_softness = constrain(gen_softness + 0.02, 0.0, 1.0); return; }
-  if (key == '\'') { gen_softness = constrain(gen_softness - 0.02, 0.0, 1.0); return; }
+  // Generator softness
+  if (key == ';')  { gen_softness = constrain(gen_softness + 0.02, 0.0, 1.0); hudDirty = true; return; }
+  if (key == '\'') { gen_softness = constrain(gen_softness - 0.02, 0.0, 1.0); hudDirty = true; return; }
 
-  // --- Generator position Y ---
-  if (key == ',') { gen_pos_y = constrain(gen_pos_y - 0.02, -1.0, 1.0); return; }
-  if (key == '.') { gen_pos_y = constrain(gen_pos_y + 0.02, -1.0, 1.0); return; }
+  // Generator position Y
+  if (key == ',') { gen_pos_y = constrain(gen_pos_y - 0.02, -1.0, 1.0); hudDirty = true; return; }
+  if (key == '.') { gen_pos_y = constrain(gen_pos_y + 0.02, -1.0, 1.0); hudDirty = true; return; }
 
-  // --- Arrow keys: cycle images (type 7) ---
+  // Arrow keys: cycle images (gen type 6)
   if (keyCode == LEFT)  { loadImageByIndex(currentImageIndex - 1); return; }
   if (keyCode == RIGHT) { loadImageByIndex(currentImageIndex + 1); return; }
 
-  // ============================================================
-  // SHIFTED keys (SHIFT + letter)
-  // ============================================================
-
+  // SHIFTED keys
   if (shifted) {
-    // Feedback tap2 amount
-    if (key == 'Q') { fb_tap2_amount = constrain(fb_tap2_amount + 0.02, 0.0, 1.0); return; }
-    if (key == 'W') { fb_tap2_amount = constrain(fb_tap2_amount - 0.02, 0.0, 1.0); return; }
-
-    // Feedback tap2 offset
-    if (key == 'E') { fb_tap2_offset = constrain(fb_tap2_offset + 0.005, -0.1, 0.1); return; }
-    if (key == 'R') { fb_tap2_offset = constrain(fb_tap2_offset - 0.005, -0.1, 0.1); return; }
-
-    // Delay amount
-    if (key == 'T') { fb_delay_amount = constrain(fb_delay_amount + 0.02, 0.0, 1.0); return; }
-
-    // Displacement amount
-    if (key == 'Y') { tf_displace = constrain(tf_displace + 0.002, 0.0, 0.1); return; }
-
-    // Saturation
-    if (key == 'S') { col_saturation = constrain(col_saturation + 0.05, 0.0, 2.0); return; }
-    if (key == 'D') { col_saturation = constrain(col_saturation - 0.05, 0.0, 2.0); return; }
-
-    // Brightness
-    if (key == 'F') { col_brightness = constrain(col_brightness + 0.02, -0.5, 0.5); return; }
-    if (key == 'G') { col_brightness = constrain(col_brightness - 0.02, -0.5, 0.5); return; }
-
-    // Contrast
-    if (key == 'H') { col_contrast = constrain(col_contrast + 0.05, 0.5, 2.0); return; }
-    if (key == 'J') { col_contrast = constrain(col_contrast - 0.05, 0.5, 2.0); return; }
-
-    // RGB separation
-    if (key == 'K') { col_rgb_sep = constrain(col_rgb_sep + 0.001, 0.0, 0.05); return; }
-    if (key == 'L') { col_rgb_sep = constrain(col_rgb_sep - 0.001, 0.0, 0.05); return; }
-
-    // Invert
-    if (key == ':') { col_invert = constrain(col_invert + 0.05, 0.0, 1.0); return; }
-    if (key == '"') { col_invert = constrain(col_invert - 0.05, 0.0, 1.0); return; }
-
-    // Blend mode
-    if (key == 'B') { blend_mode = (blend_mode + 1) % 6; return; }
-
-    // Post blur
-    if (key == 'N') { post_blur = constrain(post_blur + 0.02, 0.0, 1.0); return; }
-
-    // Post noise
-    if (key == 'M') { post_noise = constrain(post_noise + 0.002, 0.0, 0.1); return; }
-
-    // Soft clip / Sharpen
-    if (key == '<') { post_soft_clip = constrain(post_soft_clip + 0.02, 0.0, 1.0); return; }
-    if (key == '>') { post_sharpen = constrain(post_sharpen + 0.02, 0.0, 1.0); return; }
-
-    // Threshold effect
-    if (key == 'Z') { fx_threshold = constrain(fx_threshold + 0.02, 0.0, 1.0); return; }
-    if (key == 'X') { fx_threshold = constrain(fx_threshold - 0.02, 0.0, 1.0); return; }
-
-    // Pixelate
-    if (key == 'C') { fx_pixelate = constrain(fx_pixelate + 1.0, 1.0, 64.0); return; }
-    if (key == 'V') { fx_pixelate = constrain(fx_pixelate - 1.0, 1.0, 64.0); return; }
-
-    // Effects pre-feedback toggle
-    if (key == 'A') { fx_pre_fb = fx_pre_fb < 0.5 ? 1.0 : 0.0; return; }
-
-    return; // consumed shifted key
+    if (key == 'Q') { fb_tap2_amount = constrain(fb_tap2_amount + 0.02, 0.0, 1.0); hudDirty = true; return; }
+    if (key == 'W') { fb_tap2_amount = constrain(fb_tap2_amount - 0.02, 0.0, 1.0); hudDirty = true; return; }
+    if (key == 'E') { fb_tap2_offset = constrain(fb_tap2_offset + 0.005, -0.1, 0.1); hudDirty = true; return; }
+    if (key == 'R') { fb_tap2_offset = constrain(fb_tap2_offset - 0.005, -0.1, 0.1); hudDirty = true; return; }
+    if (key == 'T') { fb_delay_amount = constrain(fb_delay_amount + 0.02, 0.0, 1.0); hudDirty = true; return; }
+    if (key == 'Y') { tf_displace = constrain(tf_displace + 0.002, 0.0, 0.1); hudDirty = true; return; }
+    if (key == 'S') { col_saturation = constrain(col_saturation + 0.05, 0.0, 2.0); hudDirty = true; return; }
+    if (key == 'D') { col_saturation = constrain(col_saturation - 0.05, 0.0, 2.0); hudDirty = true; return; }
+    if (key == 'F') { col_brightness = constrain(col_brightness + 0.02, -0.5, 0.5); hudDirty = true; return; }
+    if (key == 'G') { col_brightness = constrain(col_brightness - 0.02, -0.5, 0.5); hudDirty = true; return; }
+    if (key == 'H') { col_contrast = constrain(col_contrast + 0.05, 0.5, 2.0); hudDirty = true; return; }
+    if (key == 'J') { col_contrast = constrain(col_contrast - 0.05, 0.5, 2.0); hudDirty = true; return; }
+    if (key == 'K') { col_rgb_sep = constrain(col_rgb_sep + 0.001, 0.0, 0.05); hudDirty = true; return; }
+    if (key == 'L') { col_rgb_sep = constrain(col_rgb_sep - 0.001, 0.0, 0.05); hudDirty = true; return; }
+    if (key == ':') { col_invert = constrain(col_invert + 0.05, 0.0, 1.0); hudDirty = true; return; }
+    if (key == '"') { col_invert = constrain(col_invert - 0.05, 0.0, 1.0); hudDirty = true; return; }
+    if (key == 'B') { blend_mode = (blend_mode + 1) % 6; hudDirty = true; return; }
+    if (key == 'N') { post_blur = constrain(post_blur + 0.02, 0.0, 1.0); hudDirty = true; return; }
+    if (key == 'M') { post_noise = constrain(post_noise + 0.002, 0.0, 0.1); hudDirty = true; return; }
+    if (key == '<') { post_soft_clip = constrain(post_soft_clip + 0.02, 0.0, 1.0); hudDirty = true; return; }
+    if (key == '>') { post_sharpen = constrain(post_sharpen + 0.02, 0.0, 1.0); hudDirty = true; return; }
+    if (key == 'Z') { fx_threshold = constrain(fx_threshold + 0.02, 0.0, 1.0); hudDirty = true; return; }
+    if (key == 'X') { fx_threshold = constrain(fx_threshold - 0.02, 0.0, 1.0); hudDirty = true; return; }
+    if (key == 'C') { fx_pixelate = constrain(fx_pixelate + 1.0, 1.0, 64.0); hudDirty = true; return; }
+    if (key == 'V') { fx_pixelate = constrain(fx_pixelate - 1.0, 1.0, 64.0); hudDirty = true; return; }
+    if (key == 'A') { fx_pre_fb = fx_pre_fb < 0.5 ? 1.0 : 0.0; hudDirty = true; return; }
+    return;
   }
 
-  // ============================================================
-  // UNSHIFTED lowercase keys
-  // ============================================================
-
-  // Feedback amount
-  if (key == 'q') { fb_amount = constrain(fb_amount + 0.02, 0, 1); return; }
-  if (key == 'a') { fb_amount = constrain(fb_amount - 0.02, 0, 1); return; }
-
-  // Decay
-  if (key == 'w') { fb_decay = constrain(fb_decay + 0.01, 0, 1); return; }
-  if (key == 's') { fb_decay = constrain(fb_decay - 0.01, 0, 1); return; }
-
-  // Scale
-  if (key == 'e') { tf_scale = constrain(tf_scale + 0.005, 0.9, 1.1); return; }
-  if (key == 'd') { tf_scale = constrain(tf_scale - 0.005, 0.9, 1.1); return; }
-
-  // Rotation
-  if (key == 'r') { tf_rotation = constrain(tf_rotation + 0.005, -0.1, 0.1); return; }
-  if (key == 'f') { tf_rotation = constrain(tf_rotation - 0.005, -0.1, 0.1); return; }
-
-  // Hue shift
-  if (key == 't') { col_hue_shift = (col_hue_shift + 0.02) % 1.0; return; }
-  if (key == 'g') { col_hue_shift = (col_hue_shift - 0.02 + 1.0) % 1.0; return; }
-
-  // Edge type
-  if (key == 'y') { edge_type = (edge_type + 1) % 5; return; }
-  if (key == 'h') { edge_type = (edge_type - 1 + 5) % 5; return; }
-
-  // Edge mix
-  if (key == 'u') { edge_mix = constrain(edge_mix + 0.05, 0, 1); return; }
-  if (key == 'j') { edge_mix = constrain(edge_mix - 0.05, 0, 1); return; }
-
-  // Posterize
-  if (key == 'i') { fx_posterize = constrain(fx_posterize + 1, 0, 32); return; }
-  if (key == 'k') { fx_posterize = constrain(fx_posterize - 1, 0, 32); return; }
-
-  // Solarize
-  if (key == 'o') { fx_solarize = constrain(fx_solarize + 0.05, 0, 1); return; }
-  if (key == 'l') { fx_solarize = constrain(fx_solarize - 0.05, 0, 1); return; }
-
-  // Edge pre-feedback toggle
-  if (key == 'p') { edge_pre_fb = edge_pre_fb < 0.5 ? 1.0 : 0.0; return; }
-
-  // Mirror mode
-  if (key == 'm') { tf_mirror = (tf_mirror + 1) % 5; return; }
-
-  // Generator frequency
-  if (key == 'z') { gen_frequency = constrain(gen_frequency - 0.1, 0.1, 20.0); return; }
-  if (key == 'x') { gen_frequency = constrain(gen_frequency + 0.1, 0.1, 20.0); return; }
-
-  // Generator size
-  if (key == 'c') { gen_size = constrain(gen_size - 0.02, 0.0, 1.0); return; }
-  if (key == 'v') { gen_size = constrain(gen_size + 0.02, 0.0, 1.0); return; }
-
-  // Generator pos X
-  if (key == 'b') { gen_pos_x = constrain(gen_pos_x - 0.02, -1.0, 1.0); return; }
-  if (key == 'n') { gen_pos_x = constrain(gen_pos_x + 0.02, -1.0, 1.0); return; }
+  // Unshifted lowercase
+  if (key == 'q') { fb_amount = constrain(fb_amount + 0.02, 0, 1); hudDirty = true; return; }
+  if (key == 'a') { fb_amount = constrain(fb_amount - 0.02, 0, 1); hudDirty = true; return; }
+  if (key == 'w') { fb_decay = constrain(fb_decay + 0.01, 0, 1); hudDirty = true; return; }
+  if (key == 's') { fb_decay = constrain(fb_decay - 0.01, 0, 1); hudDirty = true; return; }
+  if (key == 'e') { tf_scale = constrain(tf_scale + 0.005, 0.9, 1.1); hudDirty = true; return; }
+  if (key == 'd') { tf_scale = constrain(tf_scale - 0.005, 0.9, 1.1); hudDirty = true; return; }
+  if (key == 'r') { tf_rotation = constrain(tf_rotation + 0.005, -0.1, 0.1); hudDirty = true; return; }
+  if (key == 'f') { tf_rotation = constrain(tf_rotation - 0.005, -0.1, 0.1); hudDirty = true; return; }
+  if (key == 't') { col_hue_shift = (col_hue_shift + 0.02) % 1.0; hudDirty = true; return; }
+  if (key == 'g') { col_hue_shift = (col_hue_shift - 0.02 + 1.0) % 1.0; hudDirty = true; return; }
+  if (key == 'y') { edge_type = (edge_type + 1) % 5; hudDirty = true; return; }
+  if (key == 'h') { edge_type = (edge_type - 1 + 5) % 5; hudDirty = true; return; }
+  if (key == 'u') { edge_mix = constrain(edge_mix + 0.05, 0, 1); hudDirty = true; return; }
+  if (key == 'j') { edge_mix = constrain(edge_mix - 0.05, 0, 1); hudDirty = true; return; }
+  if (key == 'i') { fx_posterize = constrain(fx_posterize + 1, 0, 32); hudDirty = true; return; }
+  if (key == 'k') { fx_posterize = constrain(fx_posterize - 1, 0, 32); hudDirty = true; return; }
+  if (key == 'o') { fx_solarize = constrain(fx_solarize + 0.05, 0, 1); hudDirty = true; return; }
+  if (key == 'l') { fx_solarize = constrain(fx_solarize - 0.05, 0, 1); hudDirty = true; return; }
+  if (key == 'p') { edge_pre_fb = edge_pre_fb < 0.5 ? 1.0 : 0.0; hudDirty = true; return; }
+  if (key == 'm') { tf_mirror = (tf_mirror + 1) % 5; hudDirty = true; return; }
+  if (key == 'z') { gen_frequency = constrain(gen_frequency - 0.1, 0.1, 20.0); hudDirty = true; return; }
+  if (key == 'x') { gen_frequency = constrain(gen_frequency + 0.1, 0.1, 20.0); hudDirty = true; return; }
+  if (key == 'c') { gen_size = constrain(gen_size - 0.02, 0.0, 1.0); hudDirty = true; return; }
+  if (key == 'v') { gen_size = constrain(gen_size + 0.02, 0.0, 1.0); hudDirty = true; return; }
+  if (key == 'b') { gen_pos_x = constrain(gen_pos_x - 0.02, -1.0, 1.0); hudDirty = true; return; }
+  if (key == 'n') { gen_pos_x = constrain(gen_pos_x + 0.02, -1.0, 1.0); hudDirty = true; return; }
 }
 
+
+// ============================================================================
+// RESET / CLEAR / PRESETS
+// ============================================================================
 
 void resetParameters() {
-  gen_type = 1;
-  gen_frequency = 1.0;
-  gen_size = 0.3;
-  gen_pos_x = 0.0;
-  gen_pos_y = 0.0;
-  gen_softness = 0.5;
-  gen_hue = 0.0;
-  gen_intensity = 0.5;
-  gen_trigger = 0.0;
+  gen_type = 1; gen_frequency = 1.0; gen_size = 0.3;
+  gen_pos_x = 0.0; gen_pos_y = 0.0; gen_softness = 0.5;
+  gen_hue = 0.0; gen_intensity = 0.5; gen_trigger = 0.0;
 
-  fb_amount = 0.9;
-  fb_decay = 0.98;
-  fb_tap2_amount = 0.0;
-  fb_tap2_offset = 0.0;
-  fb_delay_amount = 0.0;
+  fb_amount = 0.9; fb_decay = 0.98;
+  fb_tap2_amount = 0.0; fb_tap2_offset = 0.0; fb_delay_amount = 0.0;
 
-  tf_scale = 1.01;
-  tf_rotation = 0.01;
-  tf_translate_x = 0.0;
-  tf_translate_y = 0.0;
-  tf_mirror = 0;
-  tf_displace = 0.0;
+  tf_scale = 1.01; tf_rotation = 0.01;
+  tf_translate_x = 0.0; tf_translate_y = 0.0;
+  tf_mirror = 0; tf_displace = 0.0;
 
-  edge_type = 0;
-  edge_mix = 0.5;
-  edge_threshold = 0.1;
-  edge_colour_mode = 0;
-  edge_pre_fb = 0;
+  edge_type = 0; edge_mix = 0.5; edge_threshold = 0.1;
+  edge_colour_mode = 0; edge_pre_fb = 0;
 
-  fx_posterize = 0;
-  fx_posterize_smooth = 0.0;
-  fx_solarize = 0.0;
-  fx_solarize_soft = 0.5;
-  fx_solarize_mode = 0;
-  fx_threshold = 0.0;
-  fx_pixelate = 1.0;
-  fx_pre_fb = 0;
+  fx_posterize = 0; fx_posterize_smooth = 0.0;
+  fx_solarize = 0.0; fx_solarize_soft = 0.5; fx_solarize_mode = 0;
+  fx_threshold = 0.0; fx_pixelate = 1.0; fx_pre_fb = 0;
 
-  col_hue_shift = 0.0;
-  col_saturation = 1.0;
-  col_brightness = 0.0;
-  col_contrast = 1.0;
-  col_rgb_sep = 0.0;
-  col_invert = 0.0;
+  col_hue_shift = 0.0; col_saturation = 1.0; col_brightness = 0.0;
+  col_contrast = 1.0; col_rgb_sep = 0.0; col_invert = 0.0;
 
   blend_mode = 0;
-
-  post_blur = 0.0;
-  post_noise = 0.0;
-  post_soft_clip = 0.0;
-  post_sharpen = 0.0;
+  post_blur = 0.0; post_noise = 0.0; post_soft_clip = 0.0; post_sharpen = 0.0;
 
   clearBuffers();
-}
-
-
-void clearBuffers() {
-  for (int i = 0; i < 2; i++) {
-    buffers[i].beginDraw();
-    buffers[i].background(0);
-    buffers[i].endDraw();
-  }
-  delayBuffer.beginDraw();
-  delayBuffer.background(0);
-  delayBuffer.endDraw();
-  frameCounter = 0;
+  hudDirty = true;
 }
 
 
@@ -676,134 +634,118 @@ void applyPreset(String name) {
   resetParameters();
 
   if (name.equals("tunnel")) {
-    gen_type = 1;
-    gen_intensity = 0.3;
-    fb_amount = 0.95;
-    fb_decay = 0.98;
-    tf_scale = 1.02;
-    tf_rotation = 0.02;
+    gen_type = 1; gen_intensity = 0.3;
+    fb_amount = 0.95; fb_decay = 0.98;
+    tf_scale = 1.02; tf_rotation = 0.02;
     col_hue_shift = 0.002;
+
   } else if (name.equals("psychedelic")) {
-    gen_type = 2;  // Domain-warped noise
-    gen_intensity = 0.2;
-    gen_size = 0.4;
-    gen_softness = 0.6;
-    fb_amount = 0.9;
-    fb_decay = 0.95;
+    gen_type = 2; gen_intensity = 0.2; gen_size = 0.4; gen_softness = 0.6;
+    fb_amount = 0.9; fb_decay = 0.95;
     tf_rotation = 0.03;
-    fx_solarize = 0.5;
-    fx_solarize_mode = 1;
-    col_hue_shift = 0.01;
-    col_saturation = 1.5;
+    fx_solarize = 0.5; fx_solarize_mode = 1;
+    col_hue_shift = 0.01; col_saturation = 1.5;
+
   } else if (name.equals("glitch")) {
-    gen_type = 6;
+    gen_type = 5;  // Moire (was type 6 before reaction-diff removal)
     gen_intensity = 0.4;
-    fb_amount = 0.85;
-    fb_decay = 0.9;
-    edge_type = 2;
-    edge_mix = 0.7;
-    edge_pre_fb = 1;
+    fb_amount = 0.85; fb_decay = 0.9;
+    edge_type = 2; edge_mix = 0.7; edge_pre_fb = 1;
     col_rgb_sep = 0.02;
     fx_posterize = 6;
-    tf_displace = 0.02;  // Add displacement for extra glitch
-    fb_tap2_amount = 0.3;
-    fb_tap2_offset = 0.015;
+    tf_displace = 0.02;
+    fb_tap2_amount = 0.3; fb_tap2_offset = 0.015;
+
   } else if (name.equals("minimal")) {
-    gen_type = 5;
+    gen_type = 3;  // Outlined shapes (reaction-diff removed)
     gen_intensity = 0.5;
-    fb_amount = 0.8;
-    fb_decay = 0.7;
-    tf_scale = 1.0;
-    tf_rotation = 0.0;
+    fb_amount = 0.8; fb_decay = 0.7;
+    tf_scale = 1.0; tf_rotation = 0.0;
     fx_posterize = 8;
+
   } else if (name.equals("kaleidoscope")) {
-    gen_type = 4;
-    gen_intensity = 0.4;
-    fb_amount = 0.92;
-    fb_decay = 0.96;
-    tf_scale = 1.015;
-    tf_rotation = 0.015;
-    tf_mirror = 4;
-    col_hue_shift = 0.005;
-    col_saturation = 1.3;
+    gen_type = 4; gen_intensity = 0.4;
+    fb_amount = 0.92; fb_decay = 0.96;
+    tf_scale = 1.015; tf_rotation = 0.015; tf_mirror = 4;
+    col_hue_shift = 0.005; col_saturation = 1.3;
+
   } else if (name.equals("vhs")) {
-    gen_type = 1;
-    gen_intensity = 0.4;
-    fb_amount = 0.88;
-    fb_decay = 0.92;
-    tf_scale = 1.005;
-    tf_translate_y = 0.002;
-    col_rgb_sep = 0.015;
-    col_saturation = 0.8;
-    col_contrast = 1.2;
-    post_noise = 0.03;
-    post_blur = 0.2;
+    gen_type = 1; gen_intensity = 0.4;
+    fb_amount = 0.88; fb_decay = 0.92;
+    tf_scale = 1.005; tf_translate_y = 0.002;
+    col_rgb_sep = 0.015; col_saturation = 0.8; col_contrast = 1.2;
+    post_noise = 0.03; post_blur = 0.2;
   }
+
+  hudDirty = true;
 }
 
 
-// Map MIDI CC to shader parameters
+// ============================================================================
+// MIDI CC HANDLER
+// ============================================================================
+
 void handleControllerChange(int number, float norm) {
   switch(number) {
-    // Generator
-    case 1:  gen_type      = (int)(norm * 7); break;
-    case 2:  gen_frequency = 0.1 + norm * 19.9; break;
-    case 3:  gen_size      = norm; break;
-    case 4:  gen_pos_x     = norm * 2.0 - 1.0; break;
-    case 5:  gen_pos_y     = norm * 2.0 - 1.0; break;
-    case 6:  gen_softness  = norm; break;
-    case 7:  gen_hue       = norm; break;
-    case 8:  gen_intensity = norm; break;
+    // Generator (CC 1: 7 types, indices 0-6)
+    case 1:  gen_type      = (int)(norm * 6); hudDirty = true; break;
+    case 2:  gen_frequency = 0.1 + norm * 19.9; hudDirty = true; break;
+    case 3:  gen_size      = norm; hudDirty = true; break;
+    case 4:  gen_pos_x     = norm * 2.0 - 1.0; hudDirty = true; break;
+    case 5:  gen_pos_y     = norm * 2.0 - 1.0; hudDirty = true; break;
+    case 6:  gen_softness  = norm; hudDirty = true; break;
+    case 7:  gen_hue       = norm; hudDirty = true; break;
+    case 8:  gen_intensity = norm; hudDirty = true; break;
 
     // Feedback
-    case 10: fb_amount     = norm; break;
-    case 11: fb_decay      = norm; break;
+    case 10: fb_amount     = norm; hudDirty = true; break;
+    case 11: fb_decay      = norm; hudDirty = true; break;
 
     // Transform
-    case 12: tf_scale      = 0.9 + norm * 0.2; break;
-    case 13: tf_rotation   = (norm - 0.5) * 0.2; break;
-    case 14: tf_translate_x = (norm - 0.5) * 0.2; break;
-    case 15: tf_translate_y = (norm - 0.5) * 0.2; break;
-    case 16: tf_mirror     = (int)(norm * 4); break;
+    case 12: tf_scale      = 0.9 + norm * 0.2; hudDirty = true; break;
+    case 13: tf_rotation   = (norm - 0.5) * 0.2; hudDirty = true; break;
+    case 14: tf_translate_x = (norm - 0.5) * 0.2; hudDirty = true; break;
+    case 15: tf_translate_y = (norm - 0.5) * 0.2; hudDirty = true; break;
+    case 16: tf_mirror     = (int)(norm * 4); hudDirty = true; break;
 
     // Edge detection
-    case 17: edge_type        = (int)(norm * 4); break;
-    case 18: edge_mix         = norm; break;
-    case 19: edge_threshold   = norm; break;
-    case 20: edge_colour_mode = (int)(norm * 2); break;
-    case 21: edge_pre_fb      = norm > 0.5 ? 1.0 : 0.0; break;
+    case 17: edge_type        = (int)(norm * 4); hudDirty = true; break;
+    case 18: edge_mix         = norm; hudDirty = true; break;
+    case 19: edge_threshold   = norm; hudDirty = true; break;
+    case 20: edge_colour_mode = (int)(norm * 2); hudDirty = true; break;
+    case 21: edge_pre_fb      = norm > 0.5 ? 1.0 : 0.0; hudDirty = true; break;
 
     // Effects
-    case 22: fx_posterize         = norm * 32.0; break;
-    case 23: fx_posterize_smooth  = norm; break;
-    case 24: fx_solarize          = norm; break;
-    case 25: fx_solarize_soft     = norm; break;
-    case 26: fx_solarize_mode     = (int)(norm * 2); break;
-    case 27: fx_threshold         = norm; break;
-    case 28: fx_pixelate          = 1.0 + norm * 63.0; break;
-    case 29: fx_pre_fb            = norm > 0.5 ? 1.0 : 0.0; break;
+    case 22: fx_posterize        = norm * 32.0; hudDirty = true; break;
+    case 23: fx_posterize_smooth = norm; hudDirty = true; break;
+    case 24: fx_solarize         = norm; hudDirty = true; break;
+    case 25: fx_solarize_soft    = norm; hudDirty = true; break;
+    case 26: fx_solarize_mode    = (int)(norm * 2); hudDirty = true; break;
+    case 27: fx_threshold        = norm; hudDirty = true; break;
+    case 28: fx_pixelate         = 1.0 + norm * 63.0; hudDirty = true; break;
+    case 29: fx_pre_fb           = norm > 0.5 ? 1.0 : 0.0; hudDirty = true; break;
 
     // Colour
-    case 30: col_hue_shift  = norm; break;
-    case 31: col_saturation = norm * 2.0; break;
-    case 32: col_brightness = norm - 0.5; break;
-    case 33: col_contrast   = 0.5 + norm * 1.5; break;
-    case 34: col_rgb_sep    = norm * 0.05; break;
-    case 35: col_invert     = norm; break;
+    case 30: col_hue_shift  = norm; hudDirty = true; break;
+    case 31: col_saturation = norm * 2.0; hudDirty = true; break;
+    case 32: col_brightness = norm - 0.5; hudDirty = true; break;
+    case 33: col_contrast   = 0.5 + norm * 1.5; hudDirty = true; break;
+    case 34: col_rgb_sep    = norm * 0.05; hudDirty = true; break;
+    case 35: col_invert     = norm; hudDirty = true; break;
 
     // Blend
-    case 36: blend_mode = (int)(norm * 5); break;
+    case 36: blend_mode = (int)(norm * 5); hudDirty = true; break;
 
     // Post
-    case 37: post_blur      = norm; break;
-    case 38: post_noise     = norm * 0.1; break;
-    case 39: post_soft_clip = norm; break;
-    case 40: post_sharpen   = norm; break;
+    case 37: post_blur      = norm; hudDirty = true; break;
+    case 38: post_noise     = norm * 0.1; hudDirty = true; break;
+    case 39: post_soft_clip = norm; hudDirty = true; break;
+    case 40: post_sharpen   = norm; hudDirty = true; break;
 
-    // New parameters
-    case 41: tf_displace       = norm * 0.1; break;
-    case 42: fb_tap2_amount    = norm; break;
-    case 43: fb_tap2_offset    = (norm - 0.5) * 0.2; break;
-    case 44: fb_delay_amount   = norm; break;
+    // Extended
+    case 41: tf_displace     = norm * 0.1; hudDirty = true; break;
+    case 42: fb_tap2_amount  = norm; hudDirty = true; break;
+    case 43: fb_tap2_offset  = (norm - 0.5) * 0.2; hudDirty = true; break;
+    case 44: fb_delay_amount = norm; hudDirty = true; break;
   }
 }
