@@ -769,13 +769,23 @@ void initMidi() {
 
     // Open the chosen device
     if (deviceToUse != null) {
-      deviceToUse.open();
-      midiInputDevice = deviceToUse;
-      midiTransmitter = deviceToUse.getTransmitter();
-      midiReceiver = new MidiInputReceiver();
-      midiTransmitter.setReceiver(midiReceiver);
-      midiDeviceIndex = chosenIndex;
-      println("MIDI input connected to: [" + chosenIndex + "] " + midiInfos[chosenIndex].getName());
+      try {
+        if (!deviceToUse.isOpen()) {
+          deviceToUse.open();
+        }
+        midiInputDevice = deviceToUse;
+        midiTransmitter = deviceToUse.getTransmitter();
+        midiReceiver = new MidiInputReceiver();
+        midiTransmitter.setReceiver(midiReceiver);
+        midiDeviceIndex = chosenIndex;
+        println("MIDI input connected to: [" + chosenIndex + "] " + midiInfos[chosenIndex].getName());
+      } catch (MidiUnavailableException e) {
+        println("Failed to open MIDI device [" + chosenIndex + "]: " + e.getMessage());
+        deviceToUse = null;
+      } catch (Exception e) {
+        println("MIDI setup error: " + e.getMessage());
+        deviceToUse = null;
+      }
     }
 
     if (midiInputDevice == null) {
