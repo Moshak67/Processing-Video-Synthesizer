@@ -169,7 +169,7 @@ float post_soft_clip = 0.0;
 float post_sharpen = 0.0;
 
 
-void settings() {
+void setup() {
   size(1280, 720, P2D);
   noSmooth();
 }
@@ -179,7 +179,14 @@ void setup() {
   frameRate(120);
 
   feedbackShader = loadShader("feedback.frag", "passthrough.vert");
-  blitShader     = loadShader("blit.frag",     "passthrough.vert");
+
+  // Create ping-pong buffers at reduced render resolution
+  buffers[0] = createGraphics(RENDER_W, RENDER_H, P2D);
+  buffers[1] = createGraphics(RENDER_W, RENDER_H, P2D);
+  delayBuffer = createGraphics(RENDER_W, RENDER_H, P2D);
+
+  // Clear buffers
+  clearBuffers();
 
   // Image library for generator type 6
   loadImageLibrary();
